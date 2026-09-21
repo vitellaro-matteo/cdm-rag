@@ -1,4 +1,6 @@
+import json
 from collections import Counter
+
 import pytest
 
 from cdm_rag.graph import BANKING_DIR, banking_seeds, build_graph, entity_id, layer_of
@@ -86,9 +88,107 @@ def test_polymorphic_edge_keeps_every_target(graph):
     (edge,) = [e for e in graph.outgoing(fp.entity_id) if e.attribute == "customer"]
     assert edge.is_polymorphic and len(edge.targets) == 2
     assert {graph.nodes[i].name for i in edge.to_ids} == {"Account", "Contact"}
-    # Bare names resolve from the document that wrote them (a shared group), i.e. to the Core
-    # entities, not to banking's own Account/Contact. Documented limitation in graph.py.
-    assert {graph.nodes[i].layer for i in edge.to_ids} == {"Core"}
+    # The shared group that wrote the reference sits above banking, so strict import order would
+    # pick the Core entities; the seed-layer rule points at banking's own Account/Contact instead.
+    assert {graph.nodes[i].layer for i in edge.to_ids} == {"banking"}
+    assert {graph.nodes[t.import_order_id].layer for t in edge.targets} == {"Core"}
+
+
+def test_banking_account_and_contact_have_incoming_edges(graph):
+    # Strict import order left both with none (all 17 / 16 references landed on the Core entities).
+    account, contact = banking(graph, "Account"), banking(graph, "Contact")
+    for node, total in ((account, 17), (contact, 16)):
+        assert len(graph.incoming(node.entity_id, include_audit=True)) == total
+        assert len(graph.incoming(node.entity_id)) == total  # none of them is an audit edge
+        for other in graph.find(node.name):
+            if other.layer != "banking":
+                assert graph.incoming(other.entity_id, include_audit=True) == []
+
+    sources = {(graph.nodes[e.from_id].name, e.attribute) for e in graph.incoming(account.entity_id)}
+    assert {("FinancialProduct", "customer"), ("KYC", "customer"), ("Contact", "employer")} <= sources
+    sources = {(graph.nodes[e.from_id].name, e.attribute) for e in graph.incoming(contact.entity_id)}
+    assert {("FinancialProduct", "customer"), ("KYC", "customer"), ("Account", "primaryContact")} <= sources
+
+
+def test_resolved_by_keeps_the_strict_import_order_result_visible(graph):
+    targets = [(e, t) for e in graph.edges.values() for t in e.targets]
+    assert all(t.resolved_by in {"seed_layer", "import_order"} for _, t in targets)
+    # every target that was not overridden equals the strict import-order result
+    assert all(t.entity_id == t.import_order_id for _, t in targets if t.resolved_by == "import_order")
+    deviating = Counter(t.name for _, t in targets if t.entity_id != t.import_order_id)
+    assert deviating == {"Account": 17, "Contact": 16, "Product": 7, "Lead": 4, "Opportunity": 1}
+    assert all(t.resolved_by == "seed_layer" for _, t in targets if t.entity_id != t.import_order_id)
+    assert not any(e.is_audit for e, t in targets if t.entity_id != t.import_order_id)
+
+    (edge,) = [e for e in graph.outgoing(banking(graph, "KYC").entity_id) if e.attribute == "customer"]
+    assert {t.resolved_by for t in edge.targets} == {"seed_layer"}
+    assert [graph.nodes[t.import_order_id].layer for t in edge.targets] == ["Core", "Core"]
+
+    (bank,) = [e for e in graph.outgoing(banking(graph, "Branch").entity_id) if e.attribute == "bank"]
+    (target,) = bank.targets  # seed rule and import order agree here
+    assert target.entity_id == target.import_order_id
+
+
+# --- seed-layer resolution rule, synthetic -----------------------------------
+
+
+def _write(root, path, definitions, imports=()):
+    f = root / path
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({"imports": [{"corpusPath": p, **({"moniker": m} if m else {})} for p, m in imports],
+                             "definitions": definitions}))
+    return path
+
+
+def _fk(name, target, fk):
+    ref = {"entityReference": target}
+    return {"entity": ref, "name": name, "resolutionGuidance": {"entityByReference": {
+        "allowReference": True, "foreignKeyAttribute": {"name": fk, "dataType": "entityId"}}}}
+
+
+def _synthetic(tmp_path, extra_seed_party=False):
+    """lib/Party and seed/Party share a name; Order imports only lib, so strict import order picks lib."""
+    _write(tmp_path, "lib/Party.cdm.json", [{"entityName": "Party", "hasAttributes": []}])
+    _write(tmp_path, "lib/Widget.cdm.json", [{"entityName": "Widget", "hasAttributes": []}])
+    _write(tmp_path, "seed/Party.cdm.json", [{"entityName": "Party", "hasAttributes": []}])
+    _write(tmp_path, "other/Party.cdm.json", [{"entityName": "Party", "hasAttributes": []}])
+    _write(tmp_path, "seed/Order.cdm.json", [{"entityName": "Order", "hasAttributes": [
+        _fk("party", "Party", "partyId"), _fk("widget", "Widget", "widgetId"), _fk("viaMoniker", "lib/Party", "monikerId")]}],
+        imports=[("/lib/Party.cdm.json", None), ("/lib/Widget.cdm.json", None), ("/lib/Party.cdm.json", "lib")])
+    seeds = [EntityRef("seed/Order.cdm.json", "Order"), EntityRef("seed/Party.cdm.json", "Party")]
+    if extra_seed_party:
+        seeds.append(EntityRef("other/Party.cdm.json", "Party"))
+    return Corpus(tmp_path), seeds
+
+
+def _target(graph, attribute):
+    (edge,) = [e for e in graph.edges.values() if e.attribute == attribute]
+    (target,) = edge.targets
+    return target
+
+
+def test_seed_layer_entity_wins_over_import_order(tmp_path):
+    corpus, seeds = _synthetic(tmp_path)
+    t = _target(build_graph(corpus, seeds), "party")
+    assert (t.entity_id, t.resolved_by, t.import_order_id) == ("seed/Party.cdm.json#Party", "seed_layer", "lib/Party.cdm.json#Party")
+
+
+def test_falls_back_to_import_order_when_no_seed_has_the_name(tmp_path):
+    corpus, seeds = _synthetic(tmp_path)
+    t = _target(build_graph(corpus, seeds), "widget")
+    assert (t.entity_id, t.resolved_by, t.import_order_id) == ("lib/Widget.cdm.json#Widget", "import_order", "lib/Widget.cdm.json#Widget")
+
+
+def test_ambiguous_seed_names_fall_back_to_import_order(tmp_path):
+    corpus, seeds = _synthetic(tmp_path, extra_seed_party=True)
+    t = _target(build_graph(corpus, seeds), "party")
+    assert (t.entity_id, t.resolved_by) == ("lib/Party.cdm.json#Party", "import_order")
+
+
+def test_monikered_names_are_never_overridden(tmp_path):
+    corpus, seeds = _synthetic(tmp_path)
+    t = _target(build_graph(corpus, seeds), "viaMoniker")
+    assert (t.entity_id, t.resolved_by) == ("lib/Party.cdm.json#Party", "import_order")
 
 
 def test_full_attribute_lookup_is_exact(graph):

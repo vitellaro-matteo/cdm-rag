@@ -12,12 +12,18 @@ Known limitations
 * Only seed entities get outgoing edges. Ancestors and one-hop targets are nodes with
   attributes and (incoming) edges, but their own FKs are not expanded; doing so would
   pull in most of the CRM core.
-* Bare target names are resolved through imports from the document where the reference
-  is written. Import order decides which same-named entity wins: all 17 "Account" and 16
-  "Contact" references from banking entities land on the *Core* entities, while "Opportunity"
-  and "Lead" mostly land on the banking ones. Result: banking Account/Contact (and the CRM-base
-  and Foundation ones) have NO incoming edges; only Core Account/Contact do. Whether CDM
-  intends the specialisation is unverified; a "prefer the seed layer" rule would change it.
+* Bare target names are resolved with a rule that DEVIATES from strict CDM import order.
+  Literal CDM resolution walks the imports of the document where the reference is written
+  and takes the first same-named entity; for banking documents that lands all 17 "Account"
+  and 16 "Contact" references on the *Core* entities (while "Opportunity" and "Lead" land on
+  the banking ones), leaving banking Account/Contact with no incoming edges. Instead, when a
+  bare name matches exactly one seed entity, the edge points at that seed entity
+  (``resolved_by="seed_layer"``); otherwise import order decides (``"import_order"``). The
+  rule applies to every edge because only seed entities have outgoing edges, including edges
+  inherited from an ancestor that wrote the reference in its own document. Names written
+  with a moniker ("base_Account/...") are never overridden. ``EdgeTarget.import_order_id``
+  always holds what strict import order would have picked, so the deviation stays visible.
+  Whether CDM intends the seed-layer specialisation is unverified; it is a modelling choice.
 * The applicationCommon manifest is not merged in; entity files already carry every edge.
 """
 
@@ -82,10 +88,16 @@ class EntityNode:
         return self.ref.document
 
 
+RESOLVED_BY_SEED_LAYER = "seed_layer"
+RESOLVED_BY_IMPORT_ORDER = "import_order"
+
+
 class EdgeTarget(NamedTuple):
     entity_id: str | None  # None when the name could not be resolved to an entity
     name: str
     attribute: str | None
+    resolved_by: str = RESOLVED_BY_IMPORT_ORDER  # "seed_layer" | "import_order"
+    import_order_id: str | None = None  # what strict CDM import order picks (== entity_id unless deviated)
 
 
 @dataclass(frozen=True)
@@ -173,6 +185,21 @@ def _display_names(refs: Iterable[EntityRef]) -> dict[EntityRef, str]:
     return out
 
 
+def _resolve_targets(
+    corpus: Corpus, seeds_by_name: dict[str, list[EntityRef]], rel: Relationship
+) -> list[tuple[str, str | None, EntityRef | None, str, EntityRef | None]]:
+    """(name, attribute, chosen ref, resolved_by, strict import-order ref) for each target of ``rel``."""
+    base = rel.resolve_from or rel.from_document
+    row = []
+    for t in sorted(rel.targets):
+        literal = corpus.resolve_entity(base, t.entity)
+        ref, method = literal, RESOLVED_BY_IMPORT_ORDER
+        if len(seeds_by_name.get(t.entity, ())) == 1:  # a monikered name ("lib/Party") never matches a seed name
+            ref, method = seeds_by_name[t.entity][0], RESOLVED_BY_SEED_LAYER
+        row.append((t.entity, t.attribute, ref, method, literal))
+    return row
+
+
 def build_graph(corpus: Corpus, seeds: Iterable[EntityRef]) -> Graph:
     seeds = list(dict.fromkeys(seeds))
     seed_set = set(seeds)
@@ -188,18 +215,16 @@ def build_graph(corpus: Corpus, seeds: Iterable[EntityRef]) -> Graph:
     direct = canonicalize_placeholders(direct, corpus)
     relationships = merge(direct, derived_relationships(seeds, corpus, direct))
 
-    # 2. resolve bare target names (through imports of the document that wrote them)
-    resolved: dict[tuple[str, str, str], list[tuple[str, str | None, EntityRef | None]]] = {}
+    # 2. resolve bare target names: the unique seed entity of that name if there is one,
+    #    else through imports of the document that wrote the reference (see module docstring)
+    seeds_by_name: dict[str, list[EntityRef]] = defaultdict(list)
+    for s in seeds:
+        seeds_by_name[s.name].append(s)
+    resolved = {rel.key: _resolve_targets(corpus, seeds_by_name, rel) for rel in relationships}
     refs: set[EntityRef] = set(seeds)
-    for rel in relationships:
-        base = rel.resolve_from or rel.from_document
-        row = []
-        for t in sorted(rel.targets):
-            ref = corpus.resolve_entity(base, t.entity)
-            row.append((t.entity, t.attribute, ref))
-            if ref:
-                refs.add(ref)
-        resolved[rel.key] = row
+    for row in resolved.values():
+        for _, _, ref, _, literal in row:
+            refs.update(r for r in (ref, literal) if r)
 
     # 3. close over ancestors, so every node's parent is a node
     for ref in list(refs):
@@ -230,7 +255,14 @@ def build_graph(corpus: Corpus, seeds: Iterable[EntityRef]) -> Graph:
             attribute=rel.attribute_name or rel.from_attribute,
             fk_name=rel.from_attribute,
             targets=tuple(
-                EdgeTarget(entity_id(ref) if ref else None, name, attribute) for name, attribute, ref in resolved[rel.key]
+                EdgeTarget(
+                    entity_id(ref) if ref else None,
+                    name,
+                    attribute,
+                    method,
+                    entity_id(literal) if literal else None,
+                )
+                for name, attribute, ref, method, literal in resolved[rel.key]
             ),
             is_audit=rel.is_audit,
             is_polymorphic=rel.is_polymorphic,

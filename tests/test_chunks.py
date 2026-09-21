@@ -83,7 +83,7 @@ def test_process_entity_with_inlined_audit_fields_collapses_them_and_omits_empty
     text = entity_chunks[banking_id(graph, "BusinessCheckingAccount")].text
     assert "Inherited attributes" not in text and "It has no parent entity." in text
     assert text.count("Standard audit fields") == 1  # inlined audit fields still collapse into one line
-    assert "Related entities: Account (Core), Opportunity (banking)." in text  # organization (audit) is excluded
+    assert "Related entities: Account (banking), Opportunity (banking)." in text  # organization (audit) is excluded
     assert "createdBy (" not in text and "organization (" in text  # own attribute list is unfiltered
 
 
@@ -103,7 +103,7 @@ def test_branch_to_bank_mentions_both_directions(graph, rel_chunks):
 
 def test_polymorphic_edge_lists_all_targets_in_one_sentence(graph, rel_chunks):
     chunk = rel_chunk(rel_chunks, graph, "FinancialProduct", "customer")
-    assert "customer can refer to Account (Core) or Contact (Core)" in chunk.text
+    assert "customer can refer to Account (banking) or Contact (banking)" in chunk.text
     assert chunk.is_polymorphic and len(chunk.to_ids) == 2
 
 
