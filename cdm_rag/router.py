@@ -40,6 +40,7 @@ from typing import Any
 from cdm_rag import generate
 from cdm_rag.chunks import build_attribute_chunk, build_relationship_chunk
 from cdm_rag.graph import (
+    AttributeInfo,
     Edge,
     EntityDetail,
     EntityPairRelations,
@@ -151,14 +152,25 @@ def _own_attributes_lines(detail: EntityDetail) -> list[str]:
     return lines
 
 
+def _inherited_attribute_line(a: AttributeInfo) -> str:
+    desc = f": {a.description}" if a.description else ""
+    return f"  - {a.name} ({a.data_type or 'unspecified'}){desc}"
+
+
 def _inherited_attributes_lines(detail: EntityDetail) -> list[str]:
+    """Full detail (type + description, same as ``_own_attributes_lines``), grouped by
+    ancestor -- not just names. Names alone left the *only* place an inherited attribute's type
+    or description existed as the ancestor's own (now filtered-out, see ``retrieve()``) entity
+    chunk; this is what makes filtering that chunk out lose nothing."""
     if not detail.inherited_attributes:
         return ["Inherited attributes: none."]
-    by_ancestor: dict[str, list[str]] = {}
+    by_ancestor: dict[str, list[AttributeInfo]] = {}
     for a in detail.inherited_attributes:
-        by_ancestor.setdefault(a.declared_in or "an ancestor", []).append(a.name)
+        by_ancestor.setdefault(a.declared_in or "an ancestor", []).append(a)
     lines = [f"Inherited attributes, full list by ancestor ({len(detail.inherited_attributes)} total):"]
-    lines += [f"- from {ancestor} ({len(names)}): {', '.join(names)}" for ancestor, names in by_ancestor.items()]
+    for ancestor, attrs in by_ancestor.items():
+        lines.append(f"- from {ancestor} ({len(attrs)}):")
+        lines += [_inherited_attribute_line(a) for a in attrs]
     return lines
 
 
@@ -243,13 +255,133 @@ def _section_header(text: str) -> dict[str, Any]:
     return {"text": text, "metadata": {"chunk_type": "section_header", "source": SOURCE_SECTION_HEADER}}
 
 
+#: Extra items to over-fetch from vector search when filtering same-entity-name-other-layer
+#: duplicates out of the secondary results (see retrieve()), so the filter eating into the
+#: budget doesn't leave fewer than ``k`` genuinely useful secondary items. Generous relative to
+#: the real corpus's worst case (an entity re-declared across 4 layers, i.e. 3 duplicates).
+LAYER_FILTER_OVERFETCH = 10
+
+
+def _is_other_layer_duplicate(meta: dict[str, Any], name: str, layer: str) -> bool:
+    """True for a vector hit that's another layer's entity chunk for the same entity name
+    already resolved via entity_lookup -- e.g. Account (Core) when the question resolved to
+    Account (banking). Its content is already subsumed by entity_lookup's own parent chain and
+    (now-enriched) inherited-attributes section, so keeping it around only invites the model to
+    read the wrong layer's chunk instead of the authoritative one (see the Q1 eval finding this
+    is built to fix). Scoped to entity chunks only, and only *other* layers -- the resolved
+    entity's own indexed chunk, and unrelated entities, are never touched by this filter."""
+    return meta.get("chunk_type") == "entity" and meta.get("name") == name and meta.get("layer") != layer
+
+
+def _ancestor_layer_collision(question: str, detail: EntityDetail) -> tuple[str, str] | None:
+    """(the question's own word, the colliding ancestor layer name) for the first ancestor in
+    ``detail.parent_chain`` whose layer label shares a whole word, case-insensitive, with
+    ``question`` -- e.g. "core attributes" vs. the real "Core"-layer ancestor genuinely present
+    in Account's own chain. Not a retrieval mistake: the layer name is real, correctly-sourced
+    data; this exists to have the model flag the ambiguity instead of silently picking a reading
+    (see the Q1 eval finding this is built to address). None if there's no such collision.
+    Short (<=2 char) words are skipped to avoid flagging on trivial overlaps."""
+    for ancestor_display_name in detail.parent_chain:
+        if "(" not in ancestor_display_name:
+            continue
+        layer = ancestor_display_name.rsplit("(", 1)[-1].rstrip(")")
+        for word in layer.split():
+            if len(word) <= 2:
+                continue
+            m = re.search(r"\b" + re.escape(word) + r"\b", question, re.IGNORECASE)
+            if m:
+                return question[m.start() : m.end()], layer
+    return None
+
+
+def _ambiguity_instruction(question_word: str, layer: str, entity_display_name: str) -> str:
+    return (
+        f'Ambiguity check: the word "{question_word}" in the question could mean either an '
+        f'ordinary English word (e.g. the entity\'s own primary attributes) or this schema\'s '
+        f'"{layer}" layer, which is genuinely one of {entity_display_name}\'s real ancestors in '
+        f"the context below. Do not silently pick one reading. Start your answer with one "
+        f'sentence naming this ambiguity, then address BOTH: {entity_display_name}\'s own '
+        f'attributes, and, separately, what it inherits from the "{layer}"-layer ancestor.'
+    )
+
+
+def _route(
+    question: str, graph: Graph
+) -> tuple[list[dict[str, Any]], str | None, tuple[str, str] | None, str | None]:
+    """(relation_items, header_label, exclude_other_layers_of, extra_instructions) for
+    ``question`` -- the structural part of the routing decision, split out to keep the caller's
+    own complexity down. ``exclude_other_layers_of`` is (name, resolved layer) when a single
+    entity resolved, for filtering its other-layer duplicates out of secondary vector search.
+    ``extra_instructions`` is set only when ``_ancestor_layer_collision`` finds a genuine
+    lexical ambiguity -- see ``generate.answer``'s ``extra_instructions`` parameter."""
+    pair = detect_entity_pair(question, graph)
+    if pair:
+        relations = graph.relations_between(*pair)
+        header = f"Direct schema lookup for {pair[0]} and {pair[1]} (the highest-confidence facts for this question):"
+        return relations_context(graph, relations), header, None, None
+
+    single = detect_single_entity(question, graph)
+    if single:
+        header = (
+            f"Full schema lookup for {single} -- this is the authoritative, complete record "
+            f"for the specific entity named in this question. Prefer it over anything below, "
+            f"even if a word in the question happens to coincidentally match a layer name, "
+            f"attribute name, or other label appearing elsewhere in this context (a "
+            f"coincidental wording match does not mean a different entity or layer was meant):"
+        )
+        node = find_entity(graph, single)
+        exclude = None
+        extra_instructions = None
+        if node is not None:
+            exclude = (node.name, node.layer)
+            collision = _ancestor_layer_collision(question, entity_detail(graph, node))
+            if collision:
+                extra_instructions = _ambiguity_instruction(*collision, node.display_name)
+        return entity_lookup_context(graph, single), header, exclude, extra_instructions
+
+    attr = detect_attribute(question, graph)
+    if attr:
+        header = (
+            f"Direct schema lookup for the attribute `{attr}` -- this is the authoritative, "
+            f"complete record for the specific attribute named in this question, independent of "
+            f"which entity happens to declare or inherit it. Prefer it over anything below:"
+        )
+        return attribute_lookup_context(graph, attr), header, None, None
+
+    return [], None, None, None
+
+
+def _secondary_vector_items(
+    question: str, collection: Any, k: int, seen_text: set[str], exclude_other_layers_of: tuple[str, str] | None
+) -> list[dict[str, Any]]:
+    """Top-``k`` vector hits not already in ``seen_text``, over-fetching when
+    ``exclude_other_layers_of`` is set so the filter eating into results doesn't leave fewer than
+    ``k`` genuinely useful items (see ``LAYER_FILTER_OVERFETCH``)."""
+    items: list[dict[str, Any]] = []
+    fetch_k = k + LAYER_FILTER_OVERFETCH if exclude_other_layers_of else k
+    for hit in store_query(collection, question, k=fetch_k):
+        if len(items) >= k:
+            break
+        if hit.text in seen_text:
+            continue
+        if exclude_other_layers_of and _is_other_layer_duplicate(hit.metadata, *exclude_other_layers_of):
+            continue
+        items.append({"text": hit.text, "metadata": {**dict(hit.metadata), "source": SOURCE_VECTOR_SEARCH}})
+        seen_text.add(hit.text)
+    return items
+
+
 def retrieve(question: str, graph: Graph, collection: Any, k: int = DEFAULT_K) -> list[dict[str, Any]]:
-    """Structured context for ``question``, checked in this order (first match wins):
+    """Structured context for ``question``, checked in this order (first match wins; see
+    ``_route``):
 
     * Two known entities named -> ``relations_between``'s full output (see ``relations_context``).
     * Exactly one known entity named -> that entity's full ``entity_detail``
       (see ``entity_lookup_context``) -- the same complete data ``GET /entities/{name}`` serves,
-      not the summarized entity chunk vector search would otherwise return.
+      not the summarized entity chunk vector search would otherwise return. Secondary vector
+      search then excludes other layers' chunks for that same entity name (see
+      ``_is_other_layer_duplicate``); the model reading the wrong layer's duplicate over the
+      correctly-resolved one, even when explicitly told not to, is what this removes.
     * No known entity, but one known FK attribute named (plain or FK-column form) ->
       that attribute's full ``attribute_detail`` (see ``attribute_lookup_context``) -- independent
       of which entity happens to declare or inherit it, and of whether that entity even has an
@@ -261,48 +393,29 @@ def retrieve(question: str, graph: Graph, collection: Any, k: int = DEFAULT_K) -
     always second: these lookups are the highest-confidence, most-targeted facts for a question
     that names something known, and an undifferentiated wall of context is exactly what let the
     model skim past a real near-miss earlier."""
-    relation_items: list[dict[str, Any]] = []
-    header_label: str | None = None
+    return _retrieve_with_instructions(question, graph, collection, k)[0]
 
-    pair = detect_entity_pair(question, graph)
-    if pair:
-        relations = graph.relations_between(*pair)
-        relation_items = relations_context(graph, relations)
-        header_label = f"Direct schema lookup for {pair[0]} and {pair[1]} (the highest-confidence facts for this question):"
-    else:
-        single = detect_single_entity(question, graph)
-        if single:
-            relation_items = entity_lookup_context(graph, single)
-            header_label = (
-                f"Full schema lookup for {single} -- this is the authoritative, complete record "
-                f"for the specific entity named in this question. Prefer it over anything below, "
-                f"even if a word in the question happens to coincidentally match a layer name, "
-                f"attribute name, or other label appearing elsewhere in this context (a "
-                f"coincidental wording match does not mean a different entity or layer was meant):"
-            )
-        else:
-            attr = detect_attribute(question, graph)
-            if attr:
-                relation_items = attribute_lookup_context(graph, attr)
-                header_label = (
-                    f"Direct schema lookup for the attribute `{attr}` -- this is the "
-                    f"authoritative, complete record for the specific attribute named in this "
-                    f"question, independent of which entity happens to declare or inherit it. "
-                    f"Prefer it over anything below:"
-                )
 
-    seen_text = {item["text"] for item in relation_items}
-    vector_items: list[dict[str, Any]] = []
-    for hit in store_query(collection, question, k=k):
-        if hit.text not in seen_text:
-            vector_items.append({"text": hit.text, "metadata": {**dict(hit.metadata), "source": SOURCE_VECTOR_SEARCH}})
-            seen_text.add(hit.text)
-
+def _assemble(
+    relation_items: list[dict[str, Any]], header_label: str | None, vector_items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     if relation_items and vector_items:
         return [_section_header(header_label), *relation_items, _section_header("Additional context from search:"), *vector_items]
     if relation_items:
         return [_section_header(header_label), *relation_items]
     return vector_items
+
+
+def _retrieve_with_instructions(
+    question: str, graph: Graph, collection: Any, k: int
+) -> tuple[list[dict[str, Any]], str | None]:
+    """(context, extra_instructions) -- what ``retrieve()`` and ``answer()`` both need, computed
+    once so ``answer()`` doesn't have to re-run routing and vector search a second time just to
+    also get the ambiguity instruction ``_route`` may have produced."""
+    relation_items, header_label, exclude_other_layers_of, extra_instructions = _route(question, graph)
+    seen_text = {item["text"] for item in relation_items}
+    vector_items = _secondary_vector_items(question, collection, k, seen_text, exclude_other_layers_of)
+    return _assemble(relation_items, header_label, vector_items), extra_instructions
 
 
 @dataclass(frozen=True)
@@ -317,5 +430,5 @@ class AnswerResult:
 
 def answer(question: str, graph: Graph, collection: Any, k: int = DEFAULT_K) -> AnswerResult:
     """Route, retrieve, and generate: the single entry point tying the pipeline together."""
-    context = retrieve(question, graph, collection, k=k)
-    return AnswerResult(answer=generate.answer(question, context), context=context)
+    context, extra_instructions = _retrieve_with_instructions(question, graph, collection, k)
+    return AnswerResult(answer=generate.answer(question, context, extra_instructions=extra_instructions), context=context)

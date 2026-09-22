@@ -69,14 +69,21 @@ def _context_block(chunks: list[Any]) -> str:
     return "\n\n".join(lines)
 
 
-def answer(question: str, chunks: list[Any]) -> str:
+def answer(question: str, chunks: list[Any], extra_instructions: str | None = None) -> str:
     """Ask the configured LLM to answer ``question`` using only ``chunks`` -- each a
     {"text", "metadata"} dict or a ``store.SearchResult``, typically the output of
     ``store.query()``. An empty ``chunks`` list still calls the LLM, with context that says so,
-    so rule 2 above applies uniformly rather than needing a special "nothing retrieved" path."""
+    so rule 2 above applies uniformly rather than needing a special "nothing retrieved" path.
+
+    ``extra_instructions``, when given, is appended to the system prompt for this call only --
+    e.g. router.py uses it to flag a genuine lexical ambiguity it detected between a word in the
+    question and a real ancestor layer name in the retrieved entity_lookup data (see
+    ``router._ancestor_layer_collision``), rather than baking a rule for that into every call's
+    prompt when it doesn't apply."""
+    system_prompt = f"{SYSTEM_PROMPT}\n\n{extra_instructions}" if extra_instructions else SYSTEM_PROMPT
     context = _context_block(chunks) if chunks else "(no chunks were retrieved for this question)"
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
     ]
     return llm_client.chat(messages)
