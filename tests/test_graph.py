@@ -3,7 +3,7 @@ from collections import Counter
 
 import pytest
 
-from cdm_rag.graph import BANKING_DIR, banking_seeds, build_graph, entity_id, layer_of
+from cdm_rag.graph import BANKING_DIR, NEAR_MISS_LIMIT, banking_seeds, build_graph, entity_id, layer_of
 from cdm_rag.inheritance import Corpus, EntityRef
 
 @pytest.fixture(scope="module")
@@ -216,6 +216,15 @@ def test_no_edges_between_contact_and_organization_surfaces_near_misses(graph):
     assert near[("Contact", "parentCustomer")] == ["Account", "Contact"]
     assert not any(e.is_audit for e in r.a_outgoing_near_misses)  # near-misses are non-audit only
 
+    # Contact (banking) actually has 14 non-audit outgoing edges (SLA, SLAInvoked, address,
+    # defaultChargeAccount, defaultPriceLevel, employer, enrollmentBranch, master, originatingLead,
+    # parentCustomer, preferredBranch, preferredEquipment, preferredService, preferredSystemUser).
+    # Only 3 score any relevance to "Organization" (employer/parentCustomer -> Account, master ->
+    # Contact -- Account and Contact are this graph's only polymorphic "party" targets, see
+    # _polymorphic_target_names); the other 11 are dropped outright, not merely pushed down.
+    assert {e.attribute for e in r.a_outgoing_near_misses} == {"employer", "parentCustomer", "master"}
+    assert len(r.a_outgoing_near_misses) <= NEAR_MISS_LIMIT
+
     # Organization has no non-audit incoming edges either: its only incoming edges are audit.
     assert r.b_incoming_near_misses == ()
     assert graph.incoming(r.b_ids[0], include_audit=True) != ()
@@ -234,3 +243,65 @@ def test_direct_edges_between_branch_and_bank_include_audit_and_both_directions(
     # order-independent: same result querying "Bank", "Branch"
     reverse = graph.relations_between("Bank", "Branch")
     assert {e.edge_id for e in reverse.edges} == {e.edge_id for e in r.edges}
+
+
+def _poly_fk(name, targets, fk):
+    return {
+        "entity": {"entityReference": {"entityName": "Alt", "hasAttributes": [
+            {"entity": {"entityReference": t}, "name": t + "Option"} for t in targets
+        ]}},
+        "name": name,
+        "resolutionGuidance": {"entityByReference": {
+            "allowReference": True, "foreignKeyAttribute": {"name": fk, "dataType": "entityId"}}},
+    }
+
+
+def _near_miss_scoring_corpus(tmp_path):
+    """Widget has 11 non-audit edges against missing_name="Target": 6 lexical matches (attribute
+    name contains "target"), 1 structural-only match (points at Hub, a polymorphic "party" target
+    elsewhere), and 4 with neither signal. NEAR_MISS_LIMIT=5 < 7 relevant candidates, so this
+    also exercises the cap dropping a genuinely-relevant item (hubRef), not just the irrelevant ones."""
+    for name in ("Hub", "Decoy", "Noise", "Target"):
+        _write(tmp_path, f"seed/{name}.cdm.json", [{"entityName": name, "hasAttributes": []}])
+    attrs = [_poly_fk("party", ["Hub", "Decoy"], "partyId")]  # registers Hub as a polymorphic target
+    attrs += [_fk(f"targetLike{i}", "Noise", f"targetLike{i}Id") for i in range(6)]  # lexical
+    attrs.append(_fk("hubRef", "Hub", "hubRefId"))  # structural only
+    attrs += [_fk(f"noise{i}", "Noise", f"noise{i}Id") for i in range(4)]  # zero signal
+    _write(tmp_path, "seed/Widget.cdm.json", [{"entityName": "Widget", "hasAttributes": attrs}])
+    corpus = Corpus(tmp_path)
+    seeds = [EntityRef("seed/Widget.cdm.json", "Widget")]
+    return build_graph(corpus, seeds)
+
+
+def test_near_misses_drop_zero_signal_edges_and_cap_the_rest(tmp_path):
+    g = _near_miss_scoring_corpus(tmp_path)
+    r = g.relations_between("Widget", "Target")
+
+    assert len(r.a_outgoing_near_misses) == NEAR_MISS_LIMIT  # capped, even though 7 edges scored
+    attrs = {e.attribute for e in r.a_outgoing_near_misses}
+    assert not any(a.startswith("noise") for a in attrs)  # zero-signal edges dropped outright
+    # lexical matches outrank the structural-only one; with 6 lexical candidates for 5 slots,
+    # the (relevant, but lower-ranked) structural-only "hubRef" is capped out entirely
+    assert attrs <= {f"targetLike{i}" for i in range(6)}
+    assert "hubRef" not in attrs
+
+
+def test_near_misses_keep_a_structural_only_match_when_it_fits_the_cap(tmp_path):
+    tmp_path2 = tmp_path / "b"
+    tmp_path2.mkdir()
+    for name in ("Hub", "Decoy", "Noise", "Target"):
+        _write(tmp_path2, f"seed/{name}.cdm.json", [{"entityName": name, "hasAttributes": []}])
+    attrs = [
+        _poly_fk("party", ["Hub", "Decoy"], "partyId"),
+        _fk("hubRef", "Hub", "hubRefId"),  # structural only: no lexical overlap with "Target"
+        _fk("noise0", "Noise", "noise0Id"),  # zero signal
+    ]
+    _write(tmp_path2, "seed/Widget.cdm.json", [{"entityName": "Widget", "hasAttributes": attrs}])
+    corpus = Corpus(tmp_path2)
+    g = build_graph(corpus, [EntityRef("seed/Widget.cdm.json", "Widget")])
+
+    r = g.relations_between("Widget", "Target")
+    # "party" is itself a polymorphic edge to {Hub, Decoy}, so it also scores structural (its own
+    # targets are in the polymorphic-target set by construction); "hubRef" scores structural via
+    # that same set. Both survive since 2 <= NEAR_MISS_LIMIT; "noise0" (zero signal) does not.
+    assert {e.attribute for e in r.a_outgoing_near_misses} == {"hubRef", "party"}

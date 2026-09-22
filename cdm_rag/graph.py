@@ -50,6 +50,11 @@ log = logging.getLogger(__name__)
 
 BANKING_DIR = "core/applicationCommon/foundationCommon/crmCommon/accelerators/financialServices/banking/"
 
+# Cap on relations_between()'s near-misses per side (see Graph._ranked_near_misses). An entity
+# can have a dozen-plus unrelated edges; passing all of them as "near misses" to an LLM buries
+# the couple of actually relevant ones in noise instead of surfacing them.
+NEAR_MISS_LIMIT = 5
+
 # First match wins. Labels appear in display names: "Account (CRM base)".
 _LAYERS = (
     (BANKING_DIR, "banking"),
@@ -159,8 +164,10 @@ class Graph:
         """Direct edges between every node named ``name_a`` and every node named ``name_b``
         (both directions, audit edges included, since "is there any link at all" is the
         question). When there are none, also return near-misses: ``name_a``'s own non-audit
-        outgoing edges and ``name_b``'s own non-audit incoming edges — structured data a caller
-        (e.g. an LLM prompt) can turn into "no direct relationship, but X is related via Y"."""
+        outgoing edges and ``name_b``'s own non-audit incoming edges, ranked against the *other*
+        name and capped to ``NEAR_MISS_LIMIT`` (see ``_ranked_near_misses``) — structured data a
+        caller (e.g. an LLM prompt) can turn into "no direct relationship, but X is related via
+        Y", without burying the couple of real candidates in every other edge the entity has."""
         a_ids = tuple(sorted(n.entity_id for n in self.find(name_a)))
         b_ids = tuple(sorted(n.entity_id for n in self.find(name_b)))
         a_set, b_set = set(a_ids), set(b_ids)
@@ -171,8 +178,10 @@ class Graph:
         )
         a_near = b_near = ()
         if not edges:
-            a_near = tuple(e for i in a_ids for e in self.outgoing(i))
-            b_near = tuple(e for i in b_ids for e in self.incoming(i))
+            a_all = tuple(e for i in a_ids for e in self.outgoing(i))
+            b_all = tuple(e for i in b_ids for e in self.incoming(i))
+            a_near = self._ranked_near_misses(a_all, name_b)
+            b_near = self._ranked_near_misses(b_all, name_a)
         return EntityPairRelations(
             a_name=name_a,
             b_name=name_b,
@@ -182,7 +191,66 @@ class Graph:
             has_edges=bool(edges),
             a_outgoing_near_misses=a_near,
             b_incoming_near_misses=b_near,
+            a_note=self._infrastructure_note(name_a, a_ids),
+            b_note=self._infrastructure_note(name_b, b_ids),
         )
+
+    def _polymorphic_target_names(self) -> set[str]:
+        """Entity names used as a target of any polymorphic edge, anywhere in this graph. This
+        schema's polymorphic edges are exactly the places it says "this could be any of several
+        general-purpose party/counterparty types" (here: every one targets {Account, Contact});
+        it's the closest structural analog this graph has to a generic "party" or "organization"
+        concept, and the signal that catches a near-miss a pure text match would not."""
+        names: set[str] = set()
+        for e in self.edges.values():
+            if e.is_polymorphic:
+                names.update(t.name for t in e.targets)
+        return names
+
+    def _near_miss_score(self, edge: Edge, missing_name: str) -> tuple[bool, bool]:
+        """(lexical, structural) -- both booleans, sorted True-first. Lexical: does
+        ``missing_name`` appear in the edge's own attribute name or a target entity name (e.g.
+        asking about "Bank" would favor an attribute or target literally containing "bank").
+        Structural: is a target entity itself one of this graph's polymorphic "party" types (see
+        ``_polymorphic_target_names``) -- catches a near-miss with no textual overlap at all,
+        such as Contact.employer -> Account having none with "Organization"."""
+        missing_lower = missing_name.lower()
+        target_names = {t.name for t in edge.targets}
+        lexical = missing_lower in edge.attribute.lower() or any(missing_lower in t.lower() for t in target_names)
+        structural = bool(target_names & self._polymorphic_target_names())
+        return (lexical, structural)
+
+    def _ranked_near_misses(self, edges: tuple[Edge, ...], missing_name: str) -> tuple[Edge, ...]:
+        """``edges`` (an entity's own non-audit edges), scored against ``missing_name``, with
+        anything that scores no signal at all (neither lexical nor structural, see
+        ``_near_miss_score``) dropped outright -- not padded back in to hit a quota -- and the
+        remainder capped to the top ``NEAR_MISS_LIMIT``. An entity can have a dozen-plus edges
+        with nothing to do with the entity actually asked about; passing all of them as "near
+        misses" buries the couple that are in noise rather than surfacing them. Ties among
+        equally-scored edges keep their original (insertion) order, since Python's sort is stable."""
+        scored = sorted(edges, key=lambda e: self._near_miss_score(e, missing_name), reverse=True)
+        relevant = [e for e in scored if any(self._near_miss_score(e, missing_name))]
+        return tuple(relevant[:NEAR_MISS_LIMIT])
+
+    def _infrastructure_note(self, name: str, ids: tuple[str, ...]) -> str | None:
+        """A plain-language note when every node named ``name`` has zero non-audit (business)
+        edges, in or out, anywhere in this graph -- not just within one relations_between() pair.
+        Organization is the concrete case: it has 11 incoming audit ``organizationId`` edges and
+        nothing else, so it never has a business relationship to explain, to anything."""
+        if not ids:
+            return None
+        business = sum(len(self.outgoing(i)) + len(self.incoming(i)) for i in ids)
+        if business:
+            return None
+        audit = sum(len(self.outgoing(i, include_audit=True)) + len(self.incoming(i, include_audit=True)) for i in ids)
+        if audit:
+            return (
+                f"{name} has no non-audit (business) relationships anywhere in this graph -- only "
+                f"{audit} audit edge(s) (e.g. organizationId, createdBy, ownerId) touch it. It "
+                "functions here as infrastructure/tenant metadata, not a business entity with its "
+                "own relationships, so no relationship to another business entity should be expected."
+            )
+        return f"{name} has no relationships at all (audit or otherwise) anywhere in this graph."
 
 
 @dataclass(frozen=True)
@@ -198,6 +266,8 @@ class EntityPairRelations:
     has_edges: bool
     a_outgoing_near_misses: tuple[Edge, ...] = ()
     b_incoming_near_misses: tuple[Edge, ...] = ()
+    a_note: str | None = None  # set when name_a is infrastructure-like (see _infrastructure_note)
+    b_note: str | None = None
 
 
 def entities_in(corpus: Corpus, directory: str) -> list[EntityRef]:
