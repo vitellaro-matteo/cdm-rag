@@ -1,0 +1,26 @@
+# Build (needs the CDM corpus as a named build context; see Dockerfile's header comment):
+#   docker compose build --build-context corpus=../CDM/schemaDocuments
+# Run (reads GROQ_API_KEY/LLM_MODEL from a local .env file -- never baked into the image):
+#   docker compose up
+#
+# docker compose automatically loads a .env file from this directory for ${VARIABLE}
+# interpolation below; it does not by itself inject those variables into the container, which is
+# why they're also listed under `environment:`.
+
+services:
+  cdm-rag:
+    build:
+      context: .
+      additional_contexts:
+        corpus: ../CDM/schemaDocuments
+    image: cdm-rag:latest
+    ports:
+      - "8000:8000"
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - LLM_MODEL=${LLM_MODEL}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3

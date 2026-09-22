@@ -1,0 +1,18 @@
+# The image builds its own index/env from source; none of this belongs in the build context.
+.git/
+.gitignore
+.env
+.env.example
+tests/
+pytest.ini
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.cache/
+chroma_db/
+data/index/
+*.md
+.dockerignore
+Dockerfile
