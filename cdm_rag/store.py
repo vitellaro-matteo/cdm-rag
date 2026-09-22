@@ -86,6 +86,22 @@ def open_index(
     return chromadb.PersistentClient(path=str(persist_dir)).get_collection(collection_name, embedding_function=None)
 
 
+def open_or_build_index(
+    graph: Graph,
+    persist_dir: Path | str = DEFAULT_PERSIST_DIR,
+    collection_name: str = COLLECTION_NAME,
+    model_name: str | None = None,
+) -> chromadb.api.models.Collection.Collection:
+    """Open the persisted collection at ``persist_dir`` if one already exists there; otherwise
+    build it from ``graph`` (a one-time cost for a fresh clone/environment; a machine that has
+    already built one -- e.g. from earlier dev or test runs -- just reopens it). Used by the API
+    at startup so the embedding model and a full corpus embed aren't paid on every process start."""
+    try:
+        return open_index(persist_dir=persist_dir, collection_name=collection_name)
+    except chromadb.errors.NotFoundError:
+        return build_index(graph, persist_dir=persist_dir, collection_name=collection_name, model_name=model_name)
+
+
 @dataclass(frozen=True)
 class SearchResult:
     chunk_id: str
