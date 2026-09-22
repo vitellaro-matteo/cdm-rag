@@ -1,1 +1,15 @@
 pytest
+
+# Embeddings (BAAI/bge-small-en-v1.5 by default; see cdm_rag/config.py). torch is a
+# sentence-transformers dependency; the line below points pip at the CPU-only wheels so a
+# `pip install -r requirements.txt` doesn't pull the much larger CUDA build. Drop it (and
+# install torch normally first) if you want GPU acceleration.
+--extra-index-url https://download.pytorch.org/whl/cpu
+sentence-transformers
+
+# Local, file-based vector store (no server).
+chromadb
+
+# LLM generation (see cdm_rag/llm_client.py) and .env loading.
+groq
+python-dotenv
