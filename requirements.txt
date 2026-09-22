@@ -13,3 +13,7 @@ chromadb
 # LLM generation (see cdm_rag/llm_client.py) and .env loading.
 groq
 python-dotenv
+
+# HTTP API (see cdm_rag/api.py).
+fastapi
+uvicorn
