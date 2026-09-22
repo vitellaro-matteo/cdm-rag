@@ -13,6 +13,7 @@ Y"), instead of either a bare "no relationship" or, worse, inventing one.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from cdm_rag import llm_client
@@ -69,7 +70,9 @@ def _context_block(chunks: list[Any]) -> str:
     return "\n\n".join(lines)
 
 
-def answer(question: str, chunks: list[Any], extra_instructions: str | None = None) -> str:
+def answer(
+    question: str, chunks: list[Any], extra_instructions: str | None = None, timing: dict[str, Any] | None = None
+) -> str:
     """Ask the configured LLM to answer ``question`` using only ``chunks`` -- each a
     {"text", "metadata"} dict or a ``store.SearchResult``, typically the output of
     ``store.query()``. An empty ``chunks`` list still calls the LLM, with context that says so,
@@ -79,11 +82,30 @@ def answer(question: str, chunks: list[Any], extra_instructions: str | None = No
     e.g. router.py uses it to flag a genuine lexical ambiguity it detected between a word in the
     question and a real ancestor layer name in the retrieved entity_lookup data (see
     ``router._ancestor_layer_collision``), rather than baking a rule for that into every call's
-    prompt when it doesn't apply."""
+    prompt when it doesn't apply.
+
+    ``timing``, when given a dict, gets ``prompt_build`` (seconds spent turning ``chunks`` into
+    the final prompt string) and ``llm_call`` (seconds spent in ``llm_client.chat``, wall-clock),
+    plus whatever token/server-timing stats ``llm_client.chat`` reports (see its ``capture_usage``).
+    Purely diagnostic -- omitted, this call is identical to before it existed."""
     system_prompt = f"{SYSTEM_PROMPT}\n\n{extra_instructions}" if extra_instructions else SYSTEM_PROMPT
+
+    t0 = time.perf_counter()
     context = _context_block(chunks) if chunks else "(no chunks were retrieved for this question)"
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
     ]
-    return llm_client.chat(messages)
+    if timing is not None:
+        timing["prompt_build"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    if timing is None:
+        # exact old call, unconditionally -- any existing single-arg mock of llm_client.chat
+        # (e.g. `lambda messages: ...` in tests) must keep working when timing isn't requested.
+        return llm_client.chat(messages)
+    usage: dict[str, Any] = {}
+    result = llm_client.chat(messages, capture_usage=usage)
+    timing["llm_call"] = time.perf_counter() - t0
+    timing.update(usage)
+    return result
