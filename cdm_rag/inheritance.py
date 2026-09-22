@@ -107,6 +107,15 @@ class ResolvedAttribute:
     def fk_is_placeholder(self) -> bool:
         return self.fk_name == PLACEHOLDER_FK
 
+    @property
+    def type_label(self) -> str:
+        """Human-readable type: "reference to X/Y" for a foreign key (X/Y its targets, several
+        when polymorphic), else the raw CDM data type. Shared by chunks.py and graph.py so an
+        attribute's type reads the same whether it's summarized for embedding or shown in full."""
+        if self.is_fk:
+            return "reference to " + "/".join(t.entity for t in self.fk_targets) if self.fk_targets else "reference"
+        return self.data_type or "unspecified"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,

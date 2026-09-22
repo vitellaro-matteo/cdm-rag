@@ -26,15 +26,13 @@ from pydantic import BaseModel, Field
 
 from cdm_rag import router, store
 from cdm_rag.config import corpus_path
-from cdm_rag.graph import _LAYERS, EntityNode, Graph, banking_seeds, build_graph, entity_id
-from cdm_rag.inheritance import Corpus, Origin, ResolvedAttribute
+from cdm_rag.graph import Graph, banking_seeds, build_graph, entity_detail, find_entity
+from cdm_rag.inheritance import Corpus
 
 # --- graph / collection: loaded once, cached, overridable in tests via dependency_overrides ----
 
 _graph: Graph | None = None
 _collection: Any | None = None
-
-_LAYER_PRIORITY = [label for _, label in _LAYERS]  # banking first: preferred when a name is ambiguous
 
 
 def _build_graph() -> Graph:
@@ -67,26 +65,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="cdm-rag", lifespan=lifespan)
-
-
-# --- shared lookup helper -----------------------------------------------------------------------
-
-
-def find_entity(graph: Graph, name: str) -> EntityNode | None:
-    """Exact name match if one exists, else case-insensitive; when several nodes share that name
-    (an entity re-declared across layers, e.g. Account), the most specific layer wins -- banking
-    first, then CRM accelerator, CRM base, Foundation, Core, CDS standard (see graph.py's ``_LAYERS``)."""
-    candidates = [n for n in graph.nodes.values() if n.name == name]
-    if not candidates:
-        lowered = name.lower()
-        candidates = [n for n in graph.nodes.values() if n.name.lower() == lowered]
-    if not candidates:
-        return None
-
-    def rank(node: EntityNode) -> int:
-        return _LAYER_PRIORITY.index(node.layer) if node.layer in _LAYER_PRIORITY else len(_LAYER_PRIORITY)
-
-    return min(candidates, key=rank)
 
 
 # --- /health --------------------------------------------------------------------------------
@@ -138,31 +116,27 @@ class EntityDetail(BaseModel):
     standard_attributes: list[AttributeOut]
     attribute_counts: dict[str, int]
     relationships: list[RelationshipOut]
+    other_layers: list[str] = Field(default_factory=list, description="Display names of other nodes sharing this bare name, if any.")
 
 
-def _attribute_out(graph: Graph, attr: ResolvedAttribute) -> AttributeOut:
-    declared_in = None
-    if attr.origin is not Origin.OWN:
-        node = graph.nodes.get(entity_id(attr.declared_in))
-        declared_in = node.display_name if node else str(attr.declared_in)
-    return AttributeOut(
-        name=attr.name, origin=attr.origin.value, data_type=attr.data_type, fk_name=attr.fk_name,
-        description=attr.description, declared_in=declared_in,
-    )
-
-
-def _relationship_out(graph: Graph, edge, direction: str) -> RelationshipOut:
-    if direction == "outgoing":
-        others = [graph.nodes[t.entity_id].display_name if t.entity_id in graph.nodes else t.name for t in edge.targets]
-    else:
-        node = graph.nodes.get(edge.from_id)
-        others = [node.display_name if node else edge.from_id]
-    inherited_from = None
-    if edge.inherited_from and edge.inherited_from in graph.nodes:
-        inherited_from = graph.nodes[edge.inherited_from].display_name
-    return RelationshipOut(
-        direction=direction, attribute=edge.attribute, fk_name=edge.fk_name, other_entities=others,
-        is_polymorphic=edge.is_polymorphic, fk_inferred=edge.fk_inferred, inherited_from=inherited_from,
+def _to_response(detail: Any) -> EntityDetail:
+    """Adapt a ``graph.EntityDetail`` (framework-agnostic dataclass) into this endpoint's Pydantic
+    response model. The data assembly itself -- attribute resolution, relationship lookup, parent
+    chain -- lives once in ``graph.entity_detail``; this is just a shape conversion."""
+    return EntityDetail(
+        entity_id=detail.entity_id,
+        name=detail.name,
+        display_name=detail.display_name,
+        layer=detail.layer,
+        document=detail.document,
+        description=detail.description,
+        parent_chain=list(detail.parent_chain),
+        own_attributes=[AttributeOut(**vars(a)) for a in detail.own_attributes],
+        inherited_attributes=[AttributeOut(**vars(a)) for a in detail.inherited_attributes],
+        standard_attributes=[AttributeOut(**vars(a)) for a in detail.standard_attributes],
+        attribute_counts=detail.attribute_counts,
+        relationships=[RelationshipOut(**{**vars(r), "other_entities": list(r.other_entities)}) for r in detail.relationships],
+        other_layers=list(detail.other_layers),
     )
 
 
@@ -170,34 +144,12 @@ def _relationship_out(graph: Graph, edge, direction: str) -> RelationshipOut:
 def get_entity(name: str, graph: Graph = Depends(get_graph)) -> EntityDetail:
     """Pure graph lookup -- no vector store, no LLM. Own/inherited/standard attributes, the
     parent chain, and every non-audit relationship (both directions) for the entity named
-    ``name`` (exact match preferred, else case-insensitive; see ``find_entity``)."""
+    ``name`` (exact match preferred, else case-insensitive; see ``graph.find_entity``). The same
+    assembly (``graph.entity_detail``) backs the router's single-entity context for ``/ask``."""
     node = find_entity(graph, name)
     if node is None:
         raise HTTPException(status_code=404, detail=f"no entity named {name!r}")
-
-    attrs = graph.attributes[node.entity_id]
-    counts = {o.value: 0 for o in Origin}
-    for a in attrs:
-        counts[a.origin.value] += 1
-    counts["total"] = len(attrs)
-
-    relationships = [_relationship_out(graph, e, "outgoing") for e in graph.outgoing(node.entity_id)]
-    relationships += [_relationship_out(graph, e, "incoming") for e in graph.incoming(node.entity_id)]
-
-    return EntityDetail(
-        entity_id=node.entity_id,
-        name=node.name,
-        display_name=node.display_name,
-        layer=node.layer,
-        document=node.document,
-        description=node.description,
-        parent_chain=[n.display_name for n in graph.chain(node.entity_id)[1:]],
-        own_attributes=[_attribute_out(graph, a) for a in attrs if a.origin is Origin.OWN],
-        inherited_attributes=[_attribute_out(graph, a) for a in attrs if a.origin is Origin.INHERITED],
-        standard_attributes=[_attribute_out(graph, a) for a in attrs if a.origin is Origin.STANDARD],
-        attribute_counts=counts,
-        relationships=relationships,
-    )
+    return _to_response(entity_detail(graph, node))
 
 
 # --- /ask -------------------------------------------------------------------------------------
