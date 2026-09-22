@@ -3,7 +3,17 @@ from collections import Counter
 
 import pytest
 
-from cdm_rag.graph import BANKING_DIR, NEAR_MISS_LIMIT, banking_seeds, build_graph, entity_id, layer_of
+from cdm_rag.graph import (
+    BANKING_DIR,
+    NEAR_MISS_LIMIT,
+    attribute_detail,
+    attribute_details,
+    banking_seeds,
+    build_graph,
+    entity_id,
+    known_attribute_names,
+    layer_of,
+)
 from cdm_rag.inheritance import Corpus, EntityRef
 
 @pytest.fixture(scope="module")
@@ -305,3 +315,100 @@ def test_near_misses_keep_a_structural_only_match_when_it_fits_the_cap(tmp_path)
     # targets are in the polymorphic-target set by construction); "hubRef" scores structural via
     # that same set. Both survive since 2 <= NEAR_MISS_LIMIT; "noise0" (zero signal) does not.
     assert {e.attribute for e in r.a_outgoing_near_misses} == {"hubRef", "party"}
+
+
+# --- attribute_detail, real corpus ----------------------------------------------
+
+
+def test_attribute_details_finds_regarding_object_with_its_real_polymorphic_targets(graph):
+    # regardingObject has no Edge at all: CampaignResponse (which declares it) isn't a seed
+    # entity, so its own FKs are never parsed into edges. attribute_details reads resolved
+    # attributes directly, independent of edges, and finds it anyway.
+    detail = attribute_detail(graph, "regardingObject")
+    assert detail is not None
+    assert detail.fk_name == "regardingObjectId"
+    assert detail.is_polymorphic is True
+    assert set(detail.targets) == {
+        "Account", "BookableResourceBooking", "BookableResourceBookingHeader", "Campaign",
+        "CampaignActivity", "Contact", "KnowledgeArticle", "KnowledgeBaseRecord", "Lead", "QuickCampaign",
+    }
+    assert detail.declared_by == ("CampaignResponse (CRM base)",)
+    assert detail.inherited_by == ()
+
+
+def test_attribute_details_finds_a_non_polymorphic_attribute(graph):
+    detail = attribute_detail(graph, "bank")
+    assert detail.fk_name == "bankId"
+    assert detail.is_polymorphic is False
+    assert detail.targets == ("Bank",)
+    assert set(detail.declared_by) == {"Branch (banking)", "Syndicates (banking)"}
+
+
+def test_attribute_details_excludes_audit_and_standard_fields(graph):
+    names = set(attribute_details(graph))
+    # createdBy/modifiedBy/organizationId/... (see relationships.AUDIT_ATTRIBUTES) and any
+    # CdsStandard-origin attribute never get their own attribute chunk/lookup -- same fields
+    # build_relationship_chunks already excludes via Edge.is_audit, reached here a different way
+    # since some of these have no edge at all.
+    assert names.isdisjoint({"createdBy", "modifiedBy", "organization", "transactionCurrency", "owner"})
+    assert attribute_detail(graph, "createdBy") is None
+
+
+def test_known_attribute_names_maps_both_plain_and_fk_column_forms(graph):
+    tokens = known_attribute_names(graph)
+    assert tokens["bank"] == "bank"
+    assert tokens["bankId"] == "bank"
+    assert tokens["regardingObject"] == "regardingObject"
+    assert tokens["regardingObjectId"] == "regardingObject"
+
+
+def test_no_attribute_name_maps_to_two_different_target_sets(graph):
+    # The assumption this whole feature depends on: one chunk per attribute *name* is only
+    # correct if no two entities declare that name with a different meaning (a different target
+    # set). Verified true for the real corpus by directly re-deriving each name's target set from
+    # every node's resolved attributes (not going through attribute_details' own aggregation, so
+    # this doesn't just check attribute_details agrees with itself) -- see
+    # test_attribute_name_collision_is_a_known_limitation below for what happens if it's ever not.
+    from collections import defaultdict
+
+    from cdm_rag.inheritance import Origin
+    from cdm_rag.relationships import AUDIT_ATTRIBUTES
+
+    by_name: dict[str, set[tuple[str, ...]]] = defaultdict(set)
+    for node_id, attrs in graph.attributes.items():
+        for a in attrs:
+            if a.is_fk and a.fk_targets and not a.fk_is_placeholder and a.origin is not Origin.STANDARD and a.fk_name not in AUDIT_ATTRIBUTES:
+                by_name[a.name].add(tuple(sorted(t.entity for t in a.fk_targets)))
+
+    collisions = {name: sets for name, sets in by_name.items() if len(sets) > 1}
+    assert collisions == {}
+
+    details = attribute_details(graph)
+    assert len(details) == 33
+    assert set(details) == set(by_name)
+
+
+# --- attribute_detail, synthetic: documents the collision limitation -----------
+
+
+def test_attribute_name_collision_is_a_known_limitation(tmp_path):
+    """If two unrelated entities declare an attribute with the SAME name but DIFFERENT targets,
+    attribute_details currently merges them into one entry with the UNION of both target sets --
+    it does not detect or flag the collision. Checked against the real corpus (no such collision
+    exists there today, see test_no_attribute_name_maps_to_two_different_target_sets), but this
+    pins the actual behavior for a hypothetical corpus where it does, so it can't silently change
+    (or silently start mattering) without a test noticing."""
+    for name in ("Bank", "Hotel"):
+        _write(tmp_path, f"seed/{name}.cdm.json", [{"entityName": name, "hasAttributes": []}])
+    attrs_a = [_fk("manager", "Bank", "managerId")]
+    attrs_b = [_fk("manager", "Hotel", "managerId")]
+    _write(tmp_path, "seed/A.cdm.json", [{"entityName": "A", "hasAttributes": attrs_a}])
+    _write(tmp_path, "seed/B.cdm.json", [{"entityName": "B", "hasAttributes": attrs_b}])
+    corpus = Corpus(tmp_path)
+    g = build_graph(corpus, [EntityRef("seed/A.cdm.json", "A"), EntityRef("seed/B.cdm.json", "B")])
+
+    detail = attribute_detail(g, "manager")
+    # merged, not split: both Bank and Hotel appear as if "manager" were one polymorphic concept
+    assert set(detail.targets) == {"Bank", "Hotel"}
+    assert detail.is_polymorphic is True
+    assert {n.split(" (")[0] for n in detail.declared_by} == {"A", "B"}

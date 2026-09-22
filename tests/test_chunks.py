@@ -2,6 +2,7 @@ import pytest
 
 from cdm_rag.chunks import (
     MAX_ENTITY_TOKENS,
+    build_attribute_chunks,
     build_entity_chunks,
     build_relationship_chunks,
     estimate_tokens,
@@ -28,6 +29,11 @@ def entity_chunks(graph):
 @pytest.fixture(scope="module")
 def rel_chunks(graph):
     return build_relationship_chunks(graph)
+
+
+@pytest.fixture(scope="module")
+def attr_chunks(graph):
+    return {c.attribute: c for c in build_attribute_chunks(graph)}
 
 
 def banking_id(graph, name):
@@ -176,3 +182,47 @@ def test_chunk_count_summary(graph, entity_chunks, rel_chunks):
     assert summary == {
         "entity_chunks": 51, "relationship_chunks": 92, "edges_total": 133, "edges_audit_no_chunk": 41}
     assert len({c.chunk_id for c in rel_chunks}) == len(rel_chunks)  # ids are unique
+
+
+# --- attribute chunks -----------------------------------------------------------
+
+
+def test_attribute_chunk_count_and_unique_ids(attr_chunks):
+    # additive: doesn't touch entity_chunks (51) or rel_chunks (92) counts, asserted unchanged
+    # above in test_chunk_count_summary.
+    assert len(attr_chunks) == 33
+    assert len({c.chunk_id for c in attr_chunks.values()}) == 33
+
+
+def test_polymorphic_attribute_chunk_reads_naturally_and_carries_full_metadata(attr_chunks):
+    chunk = attr_chunks["regardingObject"]
+    assert chunk.chunk_type == "attribute"
+    assert chunk.text == (
+        "The attribute `regardingObject` is a polymorphic reference (declared on "
+        "CampaignResponse (CRM base)) that can point to: Account, BookableResourceBooking, "
+        "BookableResourceBookingHeader, Campaign, CampaignActivity, Contact, KnowledgeArticle, "
+        "KnowledgeBaseRecord, Lead or QuickCampaign."
+    )
+    meta = chunk.to_dict()["metadata"]
+    assert meta["chunk_type"] == "attribute" and meta["attribute"] == "regardingObject"
+    assert meta["fk_name"] == "regardingObjectId"
+    assert meta["is_polymorphic"] is True
+    assert set(meta["targets"]) == {
+        "Account", "BookableResourceBooking", "BookableResourceBookingHeader", "Campaign",
+        "CampaignActivity", "Contact", "KnowledgeArticle", "KnowledgeBaseRecord", "Lead", "QuickCampaign",
+    }
+    assert meta["declared_by"] == ["CampaignResponse (CRM base)"]
+    assert "inherited_by" not in meta or meta["inherited_by"] == []  # none here
+
+
+def test_non_polymorphic_attribute_chunk_reads_naturally(attr_chunks):
+    chunk = attr_chunks["bank"]
+    assert chunk.text == "The attribute `bank` is a reference (declared on Branch (banking) and Syndicates (banking)) that points to Bank."
+    meta = chunk.to_dict()["metadata"]
+    assert meta["is_polymorphic"] is False
+    assert meta["targets"] == ["Bank"]
+    assert meta["fk_name"] == "bankId"
+
+
+def test_attribute_chunks_exclude_audit_and_standard_fields(attr_chunks):
+    assert set(attr_chunks).isdisjoint({"createdBy", "modifiedBy", "organization", "transactionCurrency", "owner"})

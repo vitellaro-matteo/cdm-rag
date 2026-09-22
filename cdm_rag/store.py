@@ -15,7 +15,14 @@ from typing import Any
 
 import chromadb
 
-from cdm_rag.chunks import EntityChunk, RelationshipChunk, build_entity_chunks, build_relationship_chunks
+from cdm_rag.chunks import (
+    AttributeChunk,
+    EntityChunk,
+    RelationshipChunk,
+    build_attribute_chunks,
+    build_entity_chunks,
+    build_relationship_chunks,
+)
 from cdm_rag.config import PROJECT_ROOT, embedding_model
 from cdm_rag.embeddings import embed
 from cdm_rag.graph import Graph
@@ -23,28 +30,29 @@ from cdm_rag.graph import Graph
 DEFAULT_PERSIST_DIR = PROJECT_ROOT / "chroma_db"
 COLLECTION_NAME = "cdm_chunks"
 
-Chunk = EntityChunk | RelationshipChunk
+Chunk = EntityChunk | RelationshipChunk | AttributeChunk
 
 
 def chunks_for_index(graph: Graph) -> list[Chunk]:
     """Every chunk that belongs in the vector index: entity chunks (infrastructure entities
-    already excluded, see ``config.INDEX_EXCLUDED_ENTITY_NAMES`` and ``chunks.build_entity_chunks``)
-    plus every relationship chunk (audit edges already excluded, see ``chunks.build_relationship_chunks``)."""
-    return [*build_entity_chunks(graph), *build_relationship_chunks(graph)]
+    already excluded, see ``config.INDEX_EXCLUDED_ENTITY_NAMES`` and ``chunks.build_entity_chunks``),
+    every relationship chunk (audit edges already excluded, see ``chunks.build_relationship_chunks``),
+    and every attribute chunk (audit/standard names already excluded, see ``chunks.build_attribute_chunks``)."""
+    return [*build_entity_chunks(graph), *build_relationship_chunks(graph), *build_attribute_chunks(graph)]
 
 
 def _metadata(chunk: Chunk) -> dict[str, Any]:
-    """Chroma metadata values must be str/int/float/bool/list-of-those; no dict, no None.
-    ``None`` (e.g. a root entity's ``parent_id``) is dropped rather than coerced, so its
-    absence is the signal, not a stray empty string; ``attribute_count`` (a dict) is JSON-encoded."""
+    """Chroma metadata values must be str/int/float/bool/list-of-those, and a list must be
+    non-empty. ``None`` (e.g. a root entity's ``parent_id``) and ``[]`` (e.g. an attribute with
+    no inheritors) are both dropped rather than coerced, so their absence is the signal, not a
+    stray empty value; ``attribute_count`` (a dict) is JSON-encoded. Each chunk's own ``to_dict()``
+    already turns tuple fields into lists, so this only needs to handle None/dict/empty-list."""
     out = {}
     for k, v in chunk.to_dict()["metadata"].items():
-        if v is None:
+        if v is None or v == []:
             continue
         if isinstance(v, dict):
             v = json.dumps(v)
-        elif isinstance(v, tuple):
-            v = list(v)
         out[k] = v
     return out
 

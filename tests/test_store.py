@@ -64,3 +64,15 @@ def test_reopening_the_persisted_index_returns_the_same_data(graph, index):
     assert reopened.count() == len(chunks_for_index(graph))
     results = query(reopened, "attributes of Account", k=3)
     assert any(r.metadata.get("name") == "Account" for r in results)
+
+
+def test_attribute_chunks_are_indexed_with_full_metadata_and_empty_lists_dropped(index):
+    collection, _ = index
+    got = collection.get(ids=["attribute:regardingObject"], include=["metadatas", "documents"])
+    meta = got["metadatas"][0]
+    assert meta["chunk_type"] == "attribute" and meta["attribute"] == "regardingObject"
+    assert meta["is_polymorphic"] is True
+    assert set(meta["targets"]) >= {"Account", "Contact", "KnowledgeArticle", "KnowledgeBaseRecord"}
+    assert meta["declared_by"] == ["CampaignResponse (CRM base)"]
+    assert "inherited_by" not in meta  # empty list dropped, not stored as []
+    assert got["documents"][0].startswith("The attribute `regardingObject`")

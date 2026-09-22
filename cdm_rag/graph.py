@@ -36,8 +36,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
-from cdm_rag.inheritance import Corpus, EntityRef, ResolvedAttribute
+from cdm_rag.inheritance import Corpus, EntityRef, Origin, ResolvedAttribute
 from cdm_rag.relationships import (
+    AUDIT_ATTRIBUTES,
     Relationship,
     canonicalize_placeholders,
     derived_relationships,
@@ -268,6 +269,211 @@ class EntityPairRelations:
     b_incoming_near_misses: tuple[Edge, ...] = ()
     a_note: str | None = None  # set when name_a is infrastructure-like (see _infrastructure_note)
     b_note: str | None = None
+
+
+# --- entity_detail: the single source of "everything known about one entity" ---------------------
+#
+# Used by both api.py's GET /entities/{name} (wrapped into that endpoint's Pydantic response
+# model) and router.py's single-entity context (wrapped into LLM-facing text) -- one assembly of
+# the attribute-resolution + relationship-lookup logic, two renderings, not two implementations.
+
+
+_LAYER_PRIORITY = [label for _, label in _LAYERS]  # banking first: preferred when a name is ambiguous
+
+
+def find_entity(graph: Graph, name: str) -> EntityNode | None:
+    """Exact name match if one exists, else case-insensitive; when several nodes share that name
+    (an entity re-declared across layers, e.g. Account), the most specific layer wins -- banking
+    first, then CRM accelerator, CRM base, Foundation, Core, CDS standard (see ``_LAYERS`` above)."""
+    candidates = [n for n in graph.nodes.values() if n.name == name]
+    if not candidates:
+        lowered = name.lower()
+        candidates = [n for n in graph.nodes.values() if n.name.lower() == lowered]
+    if not candidates:
+        return None
+
+    def rank(node: EntityNode) -> int:
+        return _LAYER_PRIORITY.index(node.layer) if node.layer in _LAYER_PRIORITY else len(_LAYER_PRIORITY)
+
+    return min(candidates, key=rank)
+
+
+@dataclass(frozen=True)
+class AttributeInfo:
+    name: str
+    origin: str  # "own" | "inherited" | "standard"
+    data_type: str | None = None
+    fk_name: str | None = None
+    description: str | None = None
+    declared_in: str | None = None  # display name of the ancestor that declares it; None for "own"
+
+
+@dataclass(frozen=True)
+class RelationshipInfo:
+    direction: str  # "outgoing" | "incoming"
+    attribute: str
+    fk_name: str
+    other_entities: tuple[str, ...]  # display name(s) on the other end; several when polymorphic
+    is_polymorphic: bool
+    fk_inferred: bool
+    inherited_from: str | None = None
+
+
+@dataclass(frozen=True)
+class EntityDetail:
+    """Everything known about one entity node: full (untruncated) own/inherited/standard
+    attributes, the complete ancestor chain, and every non-audit relationship, both directions.
+    Unlike an ``EntityChunk``'s text (deliberately summarized for embedding similarity), this is
+    meant to be read once an entity is already identified, when completeness matters more than
+    compactness."""
+
+    entity_id: str
+    name: str
+    display_name: str
+    layer: str
+    document: str
+    description: str | None
+    parent_chain: tuple[str, ...]  # display names, immediate parent first
+    own_attributes: tuple[AttributeInfo, ...]
+    inherited_attributes: tuple[AttributeInfo, ...]
+    standard_attributes: tuple[AttributeInfo, ...]
+    attribute_counts: dict[str, int]
+    relationships: tuple[RelationshipInfo, ...]
+    other_layers: tuple[str, ...] = ()  # display names of other nodes sharing this bare name, if any
+
+
+def _attribute_info(graph: Graph, attr: ResolvedAttribute) -> AttributeInfo:
+    declared_in = None
+    if attr.origin is not Origin.OWN:
+        node = graph.nodes.get(entity_id(attr.declared_in))
+        declared_in = node.display_name if node else str(attr.declared_in)
+    return AttributeInfo(
+        name=attr.name, origin=attr.origin.value, data_type=attr.type_label, fk_name=attr.fk_name,
+        description=attr.description, declared_in=declared_in,
+    )
+
+
+def _relationship_info(graph: Graph, edge: Edge, direction: str) -> RelationshipInfo:
+    if direction == "outgoing":
+        others = tuple(graph.nodes[t.entity_id].display_name if t.entity_id in graph.nodes else t.name for t in edge.targets)
+    else:
+        node = graph.nodes.get(edge.from_id)
+        others = (node.display_name if node else edge.from_id,)
+    inherited_from = None
+    if edge.inherited_from and edge.inherited_from in graph.nodes:
+        inherited_from = graph.nodes[edge.inherited_from].display_name
+    return RelationshipInfo(
+        direction=direction, attribute=edge.attribute, fk_name=edge.fk_name, other_entities=others,
+        is_polymorphic=edge.is_polymorphic, fk_inferred=edge.fk_inferred, inherited_from=inherited_from,
+    )
+
+
+def entity_detail(graph: Graph, node: EntityNode) -> EntityDetail:
+    """Full structured data for ``node``: the same assembly ``GET /entities/{name}`` and the
+    router's single-entity context both build on."""
+    attrs = graph.attributes[node.entity_id]
+    counts = {o.value: 0 for o in Origin}
+    for a in attrs:
+        counts[a.origin.value] += 1
+    counts["total"] = len(attrs)
+
+    relationships = tuple(_relationship_info(graph, e, "outgoing") for e in graph.outgoing(node.entity_id))
+    relationships += tuple(_relationship_info(graph, e, "incoming") for e in graph.incoming(node.entity_id))
+
+    other_layers = tuple(n.display_name for n in graph.find(node.name) if n.entity_id != node.entity_id)
+
+    return EntityDetail(
+        entity_id=node.entity_id,
+        name=node.name,
+        display_name=node.display_name,
+        layer=node.layer,
+        document=node.document,
+        description=node.description,
+        parent_chain=tuple(n.display_name for n in graph.chain(node.entity_id)[1:]),
+        own_attributes=tuple(_attribute_info(graph, a) for a in attrs if a.origin is Origin.OWN),
+        inherited_attributes=tuple(_attribute_info(graph, a) for a in attrs if a.origin is Origin.INHERITED),
+        standard_attributes=tuple(_attribute_info(graph, a) for a in attrs if a.origin is Origin.STANDARD),
+        attribute_counts=counts,
+        relationships=relationships,
+        other_layers=other_layers,
+    )
+
+
+# --- attribute_detail: "everything known about one FK attribute NAME" ----------------------------
+#
+# A separate lookup from entity_detail/relations_between, because an attribute like
+# CampaignResponse's ``regardingObject`` has real, resolved polymorphic targets but no
+# corresponding ``Edge``: only seed entities get their FKs turned into edges (see the module
+# docstring), and CampaignResponse isn't one. This reads every node's *resolved attributes*
+# instead (``graph.attributes``, already computed for every node in the graph), grouped by
+# attribute name across every entity that declares or inherits it -- independent of edges.
+
+
+@dataclass(frozen=True)
+class AttributeDetail:
+    """Everything known about one FK attribute name (e.g. "regardingObject", "customer"),
+    aggregated across every entity in the graph that declares or inherits it. Audit/standard
+    fields (createdBy, ownerId, transactionCurrencyId, ...) are excluded -- same fields
+    ``build_relationship_chunks`` already excludes via ``Edge.is_audit``, just reached here via
+    ``Origin.STANDARD`` and ``AUDIT_ATTRIBUTES`` since these attributes may have no edge at all."""
+
+    name: str
+    fk_name: str
+    targets: tuple[str, ...]  # bare target entity names, as written (not resolved to a node)
+    declared_by: tuple[str, ...]  # display names of entities where this is an OWN attribute
+    inherited_by: tuple[str, ...]  # display names of entities that inherit it
+    is_polymorphic: bool
+
+
+def _attribute_groups(graph: Graph) -> dict[str, list[tuple[EntityNode, ResolvedAttribute]]]:
+    groups: dict[str, list[tuple[EntityNode, ResolvedAttribute]]] = defaultdict(list)
+    for node_id, attrs in graph.attributes.items():
+        node = graph.nodes[node_id]
+        for a in attrs:
+            if not a.is_fk or not a.fk_targets or a.fk_is_placeholder:
+                continue
+            if a.origin is Origin.STANDARD or a.fk_name in AUDIT_ATTRIBUTES:
+                continue
+            groups[a.name].append((node, a))
+    return groups
+
+
+def attribute_details(graph: Graph) -> dict[str, AttributeDetail]:
+    """Every non-audit, non-standard FK attribute name in the graph, keyed by that name. Checked
+    against the real corpus: no two entities declare the same attribute name with different
+    target sets, so one entry per name is a safe aggregation here -- not a guarantee for every
+    possible corpus (see ``_attribute_groups``'s per-name grouping if that ever needs revisiting)."""
+    out: dict[str, AttributeDetail] = {}
+    for name, items in _attribute_groups(graph).items():
+        targets = tuple(sorted({t.entity for _, a in items for t in a.fk_targets}))
+        declared = tuple(sorted({n.display_name for n, a in items if a.origin is Origin.OWN}))
+        inherited = tuple(sorted({n.display_name for n, a in items if a.origin is Origin.INHERITED}))
+        fk_names = sorted({a.fk_name for _, a in items})
+        out[name] = AttributeDetail(
+            name=name,
+            fk_name=fk_names[0] if fk_names else "",
+            targets=targets,
+            declared_by=declared,
+            inherited_by=inherited,
+            is_polymorphic=len(targets) > 1,
+        )
+    return out
+
+
+def attribute_detail(graph: Graph, name: str) -> AttributeDetail | None:
+    return attribute_details(graph).get(name)
+
+
+def known_attribute_names(graph: Graph) -> dict[str, str]:
+    """Every token that could name a known attribute in a question -- its plain name ("bank")
+    and, when different, its FK column name ("bankId") -- mapped to the canonical (plain) name,
+    so either form resolves to the same ``AttributeDetail``."""
+    tokens: dict[str, str] = {}
+    for name, detail in attribute_details(graph).items():
+        tokens[name] = name
+        if detail.fk_name and detail.fk_name != name:
+            tokens[detail.fk_name] = name
+    return tokens
 
 
 def entities_in(corpus: Corpus, directory: str) -> list[EntityRef]:

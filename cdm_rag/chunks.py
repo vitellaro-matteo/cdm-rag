@@ -1,4 +1,5 @@
-"""Chunks for retrieval: one per entity, one per non-audit relationship edge.
+"""Chunks for retrieval: one per entity, one per non-audit relationship edge, one per distinct
+FK attribute name.
 
 The chunk text is a *search handle* (what gets embedded). It samples attributes and
 names relationships; anything that must be exact (the full attribute list, edge
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cdm_rag.config import INDEX_EXCLUDED_ENTITY_NAMES
-from cdm_rag.graph import Edge, EntityNode, Graph
+from cdm_rag.graph import AttributeDetail, Edge, EntityNode, Graph, attribute_details
 from cdm_rag.inheritance import Origin, ResolvedAttribute
 
 MAX_ENTITY_TOKENS = 300
@@ -100,6 +101,35 @@ class RelationshipChunk:
         }
 
 
+@dataclass(frozen=True)
+class AttributeChunk:
+    chunk_id: str
+    text: str
+    attribute: str
+    fk_name: str
+    targets: tuple[str, ...]
+    declared_by: tuple[str, ...]
+    inherited_by: tuple[str, ...]
+    is_polymorphic: bool
+    chunk_type: str = field(default="attribute", init=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chunk_id": self.chunk_id,
+            "chunk_type": self.chunk_type,
+            "text": self.text,
+            "metadata": {
+                "chunk_type": self.chunk_type,
+                "attribute": self.attribute,
+                "fk_name": self.fk_name,
+                "targets": list(self.targets),
+                "declared_by": list(self.declared_by),
+                "inherited_by": list(self.inherited_by),
+                "is_polymorphic": self.is_polymorphic,
+            },
+        }
+
+
 # --- helpers -----------------------------------------------------------------
 
 
@@ -123,6 +153,10 @@ def _join_or(items: list[str]) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " or " + items[-1]
 
 
+def _join_and(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
 def _humanize(word: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", " ", word).strip().lower()
 
@@ -141,12 +175,6 @@ def _short(text: str | None, limit: int = _DESCRIPTION_CHARS) -> str:
         return first
     cut = first[:limit]
     return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(",;:") + "…"
-
-
-def _type_of(a: ResolvedAttribute) -> str:
-    if a.is_fk:
-        return "reference to " + "/".join(t.entity for t in a.fk_targets) if a.fk_targets else "reference"
-    return a.data_type or "unspecified"
 
 
 def _is_shadow(a: ResolvedAttribute) -> bool:
@@ -204,7 +232,7 @@ def _entity_text(graph: Graph, node: EntityNode, own_cap: int, own_described: in
         shown = []
         for i, a in enumerate(listed[:own_cap]):
             desc = _short(a.description) if i < own_described else ""
-            shown.append(f"{a.name} ({_type_of(a)})" + (f": {desc}" if desc else ""))
+            shown.append(f"{a.name} ({a.type_label})" + (f": {desc}" if desc else ""))
         rest = f"; and {len(own) - len(shown)} more" if len(own) > len(shown) else ""
         lines.append(f"Own attributes ({len(own)}): " + "; ".join(shown) + rest + ".")
     else:
@@ -342,3 +370,53 @@ def build_relationship_chunk(graph: Graph, edge: Edge) -> RelationshipChunk:
 def build_relationship_chunks(graph: Graph) -> list[RelationshipChunk]:
     """One chunk per non-audit edge. Audit edges (createdBy, ownerId, ...) stay in the graph only."""
     return [build_relationship_chunk(graph, e) for e in graph.edges.values() if not e.is_audit]
+
+
+# --- attribute chunks ----------------------------------------------------------
+#
+# A relationship chunk describes one edge (one entity's FK to a target); this describes one FK
+# *attribute name* across every entity that declares or inherits it, independent of edges. Exists
+# because an attribute a question names directly (e.g. "regardingObject") may have no edge to
+# find: only seed entities get their FKs turned into edges (see graph.py), so an attribute
+# declared solely on a non-seed entity -- CampaignResponse's ``regardingObject``, with real
+# polymorphic targets -- would otherwise be discoverable only by luck, through whichever entity
+# chunk happens to rank high enough in vector search.
+
+
+def _declared_inherited_phrase(declared: tuple[str, ...], inherited: tuple[str, ...]) -> str:
+    parts = []
+    if declared:
+        parts.append("declared on " + _join_and(list(declared)))
+    if inherited:
+        parts.append("inherited by " + _join_and(list(inherited)))
+    return "; ".join(parts) if parts else "not declared by name on any indexed entity"
+
+
+def _attribute_text(detail: AttributeDetail) -> str:
+    phrase = _declared_inherited_phrase(detail.declared_by, detail.inherited_by)
+    if detail.is_polymorphic:
+        return (
+            f"The attribute `{detail.name}` is a polymorphic reference ({phrase}) that can point "
+            f"to: {_join_or(list(detail.targets))}."
+        )
+    return f"The attribute `{detail.name}` is a reference ({phrase}) that points to {detail.targets[0]}."
+
+
+def build_attribute_chunk(detail: AttributeDetail) -> AttributeChunk:
+    return AttributeChunk(
+        chunk_id=f"attribute:{detail.name}",
+        text=_attribute_text(detail),
+        attribute=detail.name,
+        fk_name=detail.fk_name,
+        targets=detail.targets,
+        declared_by=detail.declared_by,
+        inherited_by=detail.inherited_by,
+        is_polymorphic=detail.is_polymorphic,
+    )
+
+
+def build_attribute_chunks(graph: Graph) -> list[AttributeChunk]:
+    """One chunk per distinct FK attribute name in the graph (see ``graph.attribute_details`` for
+    what's excluded: audit/standard fields, placeholders). Additive: entity and relationship
+    chunk counts are unaffected."""
+    return [build_attribute_chunk(d) for _, d in sorted(attribute_details(graph).items())]
