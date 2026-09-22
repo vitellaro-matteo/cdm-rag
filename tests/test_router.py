@@ -193,6 +193,71 @@ def test_single_entity_question_does_not_call_relations_between_but_does_a_full_
     assert "Account" in lookup_items[0]["text"]
 
 
+# --- layer-duplicate filtering (Option A) + over-fetch, synthetic --------------
+
+
+class _FakeHit:
+    def __init__(self, text, metadata):
+        self.text = text
+        self.metadata = metadata
+
+
+def test_layer_filter_overfetches_so_k_useful_items_still_come_back(monkeypatch):
+    graph = _tiny_graph("Account", "Bank")
+    monkeypatch.setattr(graph, "relations_between", lambda a, b: pytest.fail("must not fire"))
+
+    # 3 "other layer" Account duplicates (mirrors the real corpus's worst case: Account exists in
+    # 4 layers) plus exactly 5 genuinely different hits -- if the filter starved the budget, fewer
+    # than 5 would come back; if over-fetch didn't happen, the duplicates would eat into the 5.
+    raw_hits = [
+        _FakeHit("dup-core", {"chunk_type": "entity", "name": "Account", "layer": "Core"}),
+        _FakeHit("dup-foundation", {"chunk_type": "entity", "name": "Account", "layer": "Foundation"}),
+        _FakeHit("dup-crmbase", {"chunk_type": "entity", "name": "Account", "layer": "CRM base"}),
+        _FakeHit("keep-1", {"chunk_type": "attribute", "attribute": "Account"}),
+        _FakeHit("keep-2", {"chunk_type": "entity", "name": "User", "layer": "Core"}),
+        _FakeHit("keep-3", {"chunk_type": "entity", "name": "Account", "layer": "test"}),  # resolved layer (_tiny_graph nodes are all layer="test"): kept
+        _FakeHit("keep-4", {"chunk_type": "attribute", "attribute": "address"}),
+        _FakeHit("keep-5", {"chunk_type": "entity", "name": "BusinessCheckingAccount", "layer": "banking"}),
+    ]
+    seen_k = []
+
+    def fake_store_query(collection, text, k=router.DEFAULT_K):
+        seen_k.append(k)
+        return raw_hits[:k]
+
+    monkeypatch.setattr(router, "store_query", fake_store_query)
+
+    context = router.retrieve("What are the attributes of Account?", graph, collection=object())
+
+    assert seen_k == [router.DEFAULT_K + router.LAYER_FILTER_OVERFETCH]  # over-fetched, not plain k
+    vector_items = [c for c in context if c["metadata"].get("source") == router.SOURCE_VECTOR_SEARCH]
+    assert len(vector_items) == router.DEFAULT_K  # still k genuinely useful items, not fewer
+    kept_texts = {c["text"] for c in vector_items}
+    assert kept_texts == {"keep-1", "keep-2", "keep-3", "keep-4", "keep-5"}
+    assert kept_texts.isdisjoint({"dup-core", "dup-foundation", "dup-crmbase"})
+
+
+def test_layer_filter_is_a_no_op_when_the_entity_has_no_other_layers(monkeypatch):
+    """Control case: an entity that exists in only one layer must behave exactly as before --
+    same items, same count, nothing accidentally dropped by a filter that has nothing to do."""
+    graph = _tiny_graph("Bank")  # single layer in this synthetic graph, like the real Bank
+    raw_hits = [
+        _FakeHit(f"hit-{i}", {"chunk_type": "entity", "name": n, "layer": "test"})
+        for i, n in enumerate(["Branch", "Syndicates", "FinancialProduct", "Limit", "RequestedFacility"])
+    ]
+
+    def fake_store_query(collection, text, k=router.DEFAULT_K):
+        return raw_hits[:k]
+
+    monkeypatch.setattr(router, "store_query", fake_store_query)
+
+    context = router.retrieve("What entities reference Bank?", graph, collection=object())
+
+    vector_items = [c for c in context if c["metadata"].get("source") == router.SOURCE_VECTOR_SEARCH]
+    assert len(vector_items) == router.DEFAULT_K
+    assert {c["text"] for c in vector_items} == {h.text for h in raw_hits}
+
+
 # --- context content, real corpus, mocked store_query ---------------------------
 #
 # These check relations_context()/retrieve() in isolation from vector search: fast, but they
@@ -277,6 +342,21 @@ def test_banking_account_inherit_question_gets_the_full_ancestor_chain_and_real_
     inherited_names = {a.name for a in real_graph.attributes[node.entity_id] if a.origin.value == "inherited"}
     assert len(inherited_names) == 92
     assert all(name in text for name in inherited_names)
+    # type + description too, not just names -- this is what makes filtering the ancestors'
+    # duplicate entity chunks out of secondary search (see the layer-filter tests) lose nothing:
+    # their type/description detail is now here instead.
+    assert "accountId (entityId): Unique identifier of the account." in text
+    assert "(listLookup)" in text  # a real CDM data type, not just bare names
+
+
+def test_entity_lookup_inherited_attributes_have_type_and_description_grouped_by_ancestor(real_graph):
+    items = router.entity_lookup_context(real_graph, "Account")
+    text = items[0]["text"]
+    assert "- from Account (Core) (80):" in text  # ancestor heading, count only -- not the names list
+    # the old rendering put this on the heading line itself ("... (1): defaultPriceLevel"); now
+    # each attribute is its own indented, typed line underneath.
+    assert "- from Account (Foundation) (1): defaultPriceLevel" not in text
+    assert "- from Account (Foundation) (1):\n  - defaultPriceLevel (reference to PriceList)" in text
 
 
 def test_account_core_attributes_header_warns_against_the_coincidental_core_layer_match(real_graph, monkeypatch):
@@ -291,6 +371,63 @@ def test_account_core_attributes_header_warns_against_the_coincidental_core_laye
     assert "authoritative" in header["text"].lower()
     assert "coincidental" in header["text"].lower()
     assert "layer" in header["text"].lower()
+
+
+# --- ancestor-layer lexical collision (2nd Q1 attempt) --------------------------
+
+
+def test_ancestor_layer_collision_detected_for_core(real_graph):
+    from cdm_rag.graph import entity_detail, find_entity
+
+    node = find_entity(real_graph, "Account")
+    detail = entity_detail(real_graph, node)
+    assert router._ancestor_layer_collision("What are the core attributes of the Account entity?", detail) == ("core", "Core")
+
+
+def test_ancestor_layer_collision_none_when_no_word_matches(real_graph):
+    from cdm_rag.graph import entity_detail, find_entity
+
+    node = find_entity(real_graph, "Contact")
+    detail = entity_detail(real_graph, node)
+    assert router._ancestor_layer_collision("What are the attributes of Contact?", detail) is None
+
+
+def test_route_adds_the_ambiguity_instruction_only_when_a_collision_exists(real_graph):
+    """Fast, real_index-free check of _route() itself (no vector search involved): the
+    instruction is only added for the colliding question, not for an ordinary single-entity one."""
+    _, _, _, extra_core = router._route("What are the core attributes of the Account entity?", real_graph)
+    assert extra_core is not None
+    assert "Ambiguity check" in extra_core
+    assert '"core"' in extra_core and '"Core"' in extra_core
+
+    _, _, _, extra_contact = router._route("What are the attributes of Contact?", real_graph)
+    assert extra_contact is None
+
+
+def test_account_core_attributes_prompt_includes_the_ambiguity_instruction(real_graph, real_index, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(generate.llm_client, "chat", lambda messages: seen.setdefault("messages", messages) or "ok")
+
+    router.answer("What are the core attributes of the Account entity?", real_graph, real_index)
+
+    system_content = seen["messages"][0]["content"]
+    assert "Ambiguity check" in system_content
+    assert '"core"' in system_content
+    assert '"Core"' in system_content
+    assert "own attributes" in system_content
+
+
+def test_contact_attributes_prompt_control_gets_no_ambiguity_instruction(real_graph, real_index, monkeypatch):
+    """Control question naming a single entity (Contact) whose ancestor layer names don't
+    collide with any word in the question -- the prompt must be unchanged, no regression."""
+    seen = {}
+    monkeypatch.setattr(generate.llm_client, "chat", lambda messages: seen.setdefault("messages", messages) or "ok")
+
+    router.answer("What are the attributes of Contact?", real_graph, real_index)
+
+    system_content = seen["messages"][0]["content"]
+    assert "Ambiguity check" not in system_content
+    assert system_content == generate.SYSTEM_PROMPT
 
 
 def _attribute_lookup_item(context):
@@ -376,3 +513,21 @@ def test_contact_organization_real_pipeline_message_reaches_the_llm_call(real_gr
     assert "via attribute employer" in user_content
     assert "via attribute parentCustomer" in user_content
     assert "infrastructure/tenant" in user_content
+
+
+def test_account_core_attributes_real_pipeline_excludes_other_layer_duplicates(real_graph, real_index):
+    """The actual Q1 bug, end to end: real vector search for this question does surface Account
+    (Core)/(Foundation)/(CRM base) among its raw top hits (verified separately against the live
+    index); this confirms the router's filter actually keeps them out of what reaches the model,
+    and that k genuinely useful secondary items still come back despite the filtering."""
+    context = router.retrieve("What are the core attributes of the Account entity?", real_graph, real_index)
+
+    other_layer_duplicates = [
+        c
+        for c in context
+        if c["metadata"].get("chunk_type") == "entity" and c["metadata"].get("name") == "Account" and c["metadata"].get("layer") != "banking"
+    ]
+    assert other_layer_duplicates == []
+
+    vector_items = [c for c in context if c["metadata"].get("source") == router.SOURCE_VECTOR_SEARCH]
+    assert len(vector_items) == router.DEFAULT_K  # the filter didn't starve secondary context
