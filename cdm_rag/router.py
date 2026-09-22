@@ -34,8 +34,10 @@ When a question names a known FK attribute (by its plain name or its FK column n
 from __future__ import annotations
 
 import re
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 from cdm_rag import generate
 from cdm_rag.chunks import build_attribute_chunk, build_relationship_chunk
@@ -54,6 +56,22 @@ from cdm_rag.graph import (
 from cdm_rag.store import query as store_query
 
 DEFAULT_K = 5
+
+
+@contextmanager
+def _measure(timing: dict[str, float] | None, stage: str) -> Iterator[None]:
+    """Add elapsed wall-clock seconds under ``timing[stage]`` (accumulating, since e.g.
+    "detection" can run more than once per call -- up to three regex checks before falling
+    through to plain vector search). A no-op, at the cost of one function call, when ``timing``
+    is None -- the default, and the only behavior every existing caller sees."""
+    if timing is None:
+        yield
+        return
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        timing[stage] = timing.get(stage, 0.0) + (time.perf_counter() - t0)
 
 
 def known_entity_names(graph: Graph) -> list[str]:
@@ -306,21 +324,30 @@ def _ambiguity_instruction(question_word: str, layer: str, entity_display_name: 
 
 
 def _route(
-    question: str, graph: Graph
+    question: str, graph: Graph, timing: dict[str, float] | None = None
 ) -> tuple[list[dict[str, Any]], str | None, tuple[str, str] | None, str | None]:
     """(relation_items, header_label, exclude_other_layers_of, extra_instructions) for
     ``question`` -- the structural part of the routing decision, split out to keep the caller's
     own complexity down. ``exclude_other_layers_of`` is (name, resolved layer) when a single
     entity resolved, for filtering its other-layer duplicates out of secondary vector search.
     ``extra_instructions`` is set only when ``_ancestor_layer_collision`` finds a genuine
-    lexical ambiguity -- see ``generate.answer``'s ``extra_instructions`` parameter."""
-    pair = detect_entity_pair(question, graph)
-    if pair:
-        relations = graph.relations_between(*pair)
-        header = f"Direct schema lookup for {pair[0]} and {pair[1]} (the highest-confidence facts for this question):"
-        return relations_context(graph, relations), header, None, None
+    lexical ambiguity -- see ``generate.answer``'s ``extra_instructions`` parameter.
 
-    single = detect_single_entity(question, graph)
+    ``timing``, when given a dict, accumulates wall-clock seconds under ``"detection"`` (the
+    regex name-matching calls: 1-3 of them run depending on how many come up empty before a
+    match, or all 3 for a question naming nothing known) and ``"graph_lookup"`` (whichever of
+    ``relations_between``/``entity_detail``/``attribute_detail`` actually fires)."""
+    with _measure(timing, "detection"):
+        pair = detect_entity_pair(question, graph)
+    if pair:
+        with _measure(timing, "graph_lookup"):
+            relations = graph.relations_between(*pair)
+            items = relations_context(graph, relations)
+        header = f"Direct schema lookup for {pair[0]} and {pair[1]} (the highest-confidence facts for this question):"
+        return items, header, None, None
+
+    with _measure(timing, "detection"):
+        single = detect_single_entity(question, graph)
     if single:
         header = (
             f"Full schema lookup for {single} -- this is the authoritative, complete record "
@@ -329,37 +356,49 @@ def _route(
             f"attribute name, or other label appearing elsewhere in this context (a "
             f"coincidental wording match does not mean a different entity or layer was meant):"
         )
-        node = find_entity(graph, single)
-        exclude = None
-        extra_instructions = None
-        if node is not None:
-            exclude = (node.name, node.layer)
-            collision = _ancestor_layer_collision(question, entity_detail(graph, node))
-            if collision:
-                extra_instructions = _ambiguity_instruction(*collision, node.display_name)
-        return entity_lookup_context(graph, single), header, exclude, extra_instructions
+        with _measure(timing, "graph_lookup"):
+            node = find_entity(graph, single)
+            exclude = None
+            extra_instructions = None
+            if node is not None:
+                exclude = (node.name, node.layer)
+                collision = _ancestor_layer_collision(question, entity_detail(graph, node))
+                if collision:
+                    extra_instructions = _ambiguity_instruction(*collision, node.display_name)
+            items = entity_lookup_context(graph, single)
+        return items, header, exclude, extra_instructions
 
-    attr = detect_attribute(question, graph)
+    with _measure(timing, "detection"):
+        attr = detect_attribute(question, graph)
     if attr:
         header = (
             f"Direct schema lookup for the attribute `{attr}` -- this is the authoritative, "
             f"complete record for the specific attribute named in this question, independent of "
             f"which entity happens to declare or inherit it. Prefer it over anything below:"
         )
-        return attribute_lookup_context(graph, attr), header, None, None
+        with _measure(timing, "graph_lookup"):
+            items = attribute_lookup_context(graph, attr)
+        return items, header, None, None
 
     return [], None, None, None
 
 
 def _secondary_vector_items(
-    question: str, collection: Any, k: int, seen_text: set[str], exclude_other_layers_of: tuple[str, str] | None
+    question: str,
+    collection: Any,
+    k: int,
+    seen_text: set[str],
+    exclude_other_layers_of: tuple[str, str] | None,
+    timing: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Top-``k`` vector hits not already in ``seen_text``, over-fetching when
     ``exclude_other_layers_of`` is set so the filter eating into results doesn't leave fewer than
     ``k`` genuinely useful items (see ``LAYER_FILTER_OVERFETCH``)."""
     items: list[dict[str, Any]] = []
     fetch_k = k + LAYER_FILTER_OVERFETCH if exclude_other_layers_of else k
-    for hit in store_query(collection, question, k=fetch_k):
+    with _measure(timing, "vector_query"):
+        hits = store_query(collection, question, k=fetch_k)
+    for hit in hits:
         if len(items) >= k:
             break
         if hit.text in seen_text:
@@ -407,15 +446,17 @@ def _assemble(
 
 
 def _retrieve_with_instructions(
-    question: str, graph: Graph, collection: Any, k: int
+    question: str, graph: Graph, collection: Any, k: int, timing: dict[str, float] | None = None
 ) -> tuple[list[dict[str, Any]], str | None]:
     """(context, extra_instructions) -- what ``retrieve()`` and ``answer()`` both need, computed
     once so ``answer()`` doesn't have to re-run routing and vector search a second time just to
     also get the ambiguity instruction ``_route`` may have produced."""
-    relation_items, header_label, exclude_other_layers_of, extra_instructions = _route(question, graph)
+    relation_items, header_label, exclude_other_layers_of, extra_instructions = _route(question, graph, timing)
     seen_text = {item["text"] for item in relation_items}
-    vector_items = _secondary_vector_items(question, collection, k, seen_text, exclude_other_layers_of)
-    return _assemble(relation_items, header_label, vector_items), extra_instructions
+    vector_items = _secondary_vector_items(question, collection, k, seen_text, exclude_other_layers_of, timing)
+    with _measure(timing, "context_assembly"):
+        context = _assemble(relation_items, header_label, vector_items)
+    return context, extra_instructions
 
 
 @dataclass(frozen=True)
@@ -428,7 +469,21 @@ class AnswerResult:
     context: list[dict[str, Any]] = field(default_factory=list)
 
 
-def answer(question: str, graph: Graph, collection: Any, k: int = DEFAULT_K) -> AnswerResult:
-    """Route, retrieve, and generate: the single entry point tying the pipeline together."""
-    context, extra_instructions = _retrieve_with_instructions(question, graph, collection, k)
-    return AnswerResult(answer=generate.answer(question, context, extra_instructions=extra_instructions), context=context)
+def answer(
+    question: str, graph: Graph, collection: Any, k: int = DEFAULT_K, timing: dict[str, float] | None = None
+) -> AnswerResult:
+    """Route, retrieve, and generate: the single entry point tying the pipeline together.
+
+    ``timing``, when given a dict, is populated with a wall-clock breakdown -- ``detection``,
+    ``graph_lookup``, ``vector_query``, ``context_assembly`` (all from routing/retrieval, see
+    ``_route``/``_retrieve_with_instructions``), ``prompt_build`` and ``llm_call`` (from
+    ``generate.answer``), Groq's own reported token/server-timing stats (from
+    ``llm_client.chat``'s ``capture_usage``), and ``total`` (this function's own wall-clock time,
+    end to end). Purely diagnostic: omitted (the default), this call is identical to before the
+    parameter existed -- every ``_measure`` call above is a no-op without a dict to write into."""
+    t0 = time.perf_counter()
+    context, extra_instructions = _retrieve_with_instructions(question, graph, collection, k, timing)
+    text = generate.answer(question, context, extra_instructions=extra_instructions, timing=timing)
+    if timing is not None:
+        timing["total"] = time.perf_counter() - t0
+    return AnswerResult(answer=text, context=context)
