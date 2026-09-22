@@ -20,6 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from cdm_rag.config import INDEX_EXCLUDED_ENTITY_NAMES
 from cdm_rag.graph import Edge, EntityNode, Graph
 from cdm_rag.inheritance import Origin, ResolvedAttribute
 
@@ -120,6 +121,16 @@ def _article(word: str) -> str:
 
 def _join_or(items: list[str]) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " or " + items[-1]
+
+
+def _humanize(word: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", " ", word).strip().lower()
+
+
+def _self_qualifier(attribute: str, target_name: str) -> str:
+    """Strip a target-name suffix so "parentAccount" -> "parent" for target "Account"."""
+    stripped = attribute[: -len(target_name)] if target_name and attribute.endswith(target_name) else attribute
+    return _humanize(stripped) or _humanize(attribute)
 
 
 def _short(text: str | None, limit: int = _DESCRIPTION_CHARS) -> str:
@@ -261,7 +272,13 @@ def build_entity_chunk(graph: Graph, node: EntityNode) -> EntityChunk:
 
 
 def build_entity_chunks(graph: Graph) -> list[EntityChunk]:
-    return [build_entity_chunk(graph, n) for n in sorted(graph.nodes.values(), key=lambda n: n.entity_id)]
+    """One chunk per node, except infrastructure entities (``INDEX_EXCLUDED_ENTITY_NAMES``):
+    they stay in ``graph.nodes`` for exact-name lookup and parent chains, just not indexed."""
+    return [
+        build_entity_chunk(graph, n)
+        for n in sorted(graph.nodes.values(), key=lambda n: n.entity_id)
+        if n.name not in INDEX_EXCLUDED_ENTITY_NAMES
+    ]
 
 
 # --- relationship chunks -------------------------------------------------------
@@ -283,6 +300,14 @@ def _relationship_text(graph: Graph, edge: Edge) -> str:
             f"{edge.attribute} can refer to {_join_or(targets)}. "
             f"Each {frm} record refers to one record of one of these types. "
             f"Reverse: {_article(targets[0])} {_join_or(targets)} can be referred to by many {frm} records."
+        )
+    elif edge.to_ids and edge.to_ids[0] == edge.from_id:  # e.g. Account.parentAccount -> Account
+        to = targets[0]
+        qualifier = _self_qualifier(edge.attribute, edge.targets[0].name)
+        text = (
+            f"{_article(frm).capitalize()} {frm} can have {_article(qualifier)} {qualifier} {to}, "
+            f"via attribute {edge.attribute} ({fk}). "
+            f"Reverse: {_article(to).capitalize()} {to} can be the {qualifier} of many {frm} records."
         )
     else:
         to = targets[0]

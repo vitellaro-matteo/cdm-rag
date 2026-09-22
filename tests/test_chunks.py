@@ -6,6 +6,7 @@ from cdm_rag.chunks import (
     build_relationship_chunks,
     estimate_tokens,
 )
+from cdm_rag.config import INDEX_EXCLUDED_ENTITY_NAMES
 from cdm_rag.graph import banking_seeds, build_graph
 from cdm_rag.inheritance import Corpus, EntityRef
 
@@ -72,11 +73,23 @@ def test_entity_chunk_metadata(graph, entity_chunks):
 
 
 def test_one_entity_chunk_per_node_within_token_budget(graph, entity_chunks):
-    assert set(entity_chunks) == set(graph.nodes)
-    assert len(entity_chunks) == 54
+    # One chunk per node, except the infrastructure entities excluded from the index (below).
+    assert set(entity_chunks) == set(graph.nodes) - {n.entity_id for n in graph.nodes.values() if n.name in INDEX_EXCLUDED_ENTITY_NAMES}
+    assert len(entity_chunks) == 51
     assert max(estimate_tokens(c.text) for c in entity_chunks.values()) <= MAX_ENTITY_TOKENS
     for c in entity_chunks.values():
         assert c.text.count("Standard audit fields") <= 1
+
+
+def test_infrastructure_entities_are_excluded_from_the_index_but_stay_in_the_graph(graph, entity_chunks):
+    for name in INDEX_EXCLUDED_ENTITY_NAMES:
+        (node,) = graph.find(name)
+        assert node.entity_id in graph.nodes  # still a graph node: exact-name lookup and parent chains work
+        assert node.entity_id not in entity_chunks  # but no entity chunk is built for it
+    # CampaignResponse's parent chain still walks through the excluded ActivitySystem/ActivityCommon
+    (campaign_response,) = graph.find("CampaignResponse")
+    chain_names = [n.name for n in graph.chain(campaign_response.entity_id)]
+    assert {"ActivitySystem", "ActivityCommon", "CdsStandard"} <= set(chain_names)
 
 
 def test_process_entity_with_inlined_audit_fields_collapses_them_and_omits_empty_sections(graph, entity_chunks):
@@ -105,6 +118,24 @@ def test_polymorphic_edge_lists_all_targets_in_one_sentence(graph, rel_chunks):
     chunk = rel_chunk(rel_chunks, graph, "FinancialProduct", "customer")
     assert "customer can refer to Account (banking) or Contact (banking)" in chunk.text
     assert chunk.is_polymorphic and len(chunk.to_ids) == 2
+
+
+def test_self_edge_reads_as_a_qualified_reference_not_a_tautology(graph, rel_chunks):
+    # The seed-layer rule (see graph.py) makes Account.parentAccount and Account.master point
+    # back at Account (banking) itself; the plain template would read "Account has a
+    # many-to-one relationship to Account", so self-edges get their own phrasing.
+    account_id = banking_id(graph, "Account")
+    parent = rel_chunk(rel_chunks, graph, "Account", "parentAccount")
+    assert parent.from_id == account_id and parent.to_ids == (account_id,)
+    assert "Account (banking) has a many-to-one relationship to Account (banking)" not in parent.text
+    assert "can have a parent Account (banking), via attribute parentAccount" in parent.text
+    assert "can be the parent of many Account (banking) records" in parent.text
+    assert parent.text[0].isupper()
+
+    master = rel_chunk(rel_chunks, graph, "Account", "master")
+    assert master.from_id == account_id and master.to_ids == (account_id,)
+    assert "can have a master Account (banking), via attribute master" in master.text
+    assert master.text[0].isupper()
 
 
 def test_four_way_polymorphic_edge_from_core(corpus):
@@ -143,5 +174,5 @@ def test_chunk_count_summary(graph, entity_chunks, rel_chunks):
         "edges_audit_no_chunk": sum(e.is_audit for e in graph.edges.values()),
     }
     assert summary == {
-        "entity_chunks": 54, "relationship_chunks": 92, "edges_total": 133, "edges_audit_no_chunk": 41}
+        "entity_chunks": 51, "relationship_chunks": 92, "edges_total": 133, "edges_audit_no_chunk": 41}
     assert len({c.chunk_id for c in rel_chunks}) == len(rel_chunks)  # ids are unique
