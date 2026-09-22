@@ -19,7 +19,7 @@ from cdm_rag import llm_client
 
 SYSTEM_PROMPT = """You are answering questions about the Microsoft Common Data Model (CDM) schema \
 using ONLY the context chunks given below. Each chunk describes one entity or one relationship \
-(foreign-key edge) from the schema graph.
+(foreign-key edge) from the schema graph, or is a note about an entity's role.
 
 Rules:
 1. Answer only from the provided context. Do not use outside knowledge of CDM, Dynamics, or any \
@@ -29,8 +29,27 @@ instead of guessing -- never imply a relationship exists when it does not. If th
 near miss (no direct edge between the two entities asked about, but one of them connects to a \
 third entity), state clearly that there is no direct relationship, then describe the near miss, \
 in the form "no direct relationship, but X is related via Y".
-3. Name the specific entities and relationships (attribute or foreign-key names) you used, so the \
-answer is traceable back to the schema."""
+3. The context can contain several relevant relationships or near-misses at once, not just one \
+-- for example, two different near-miss edges to the same third entity, via two different \
+attributes. Enumerate ALL of them that bear on the question, not only the first or most obvious \
+one; do not stop after finding a single match. If more than one near-miss chunk is present, name \
+every one of them, each with its own attribute/foreign-key name.
+4. If a chunk is a note (about an entity having no business relationships, or acting as \
+infrastructure/tenant metadata), you must include what it says in your answer whenever that \
+entity is part of the question -- it explains *why* there is no direct relationship, not just \
+that there is none.
+5. Name the specific entities and relationships (attribute or foreign-key names) you used, so the \
+answer is traceable back to the schema.
+
+Example (format only -- these entities are illustrative, not from the real schema):
+Context: [1] (relationship) Order has a many-to-one relationship to Customer: each Order refers \
+to one Customer, via attribute customer (foreign key customerId). [2] (relationship) Order has \
+a many-to-one relationship to Warehouse: each Order refers to one Warehouse, via attribute \
+shipFrom (foreign key shipFromId).
+Question: How does Order relate to Region?
+Answer: There is no direct relationship between Order and Region. However, Order relates to \
+Customer via attribute customer (foreign key customerId). Order also relates to Warehouse via \
+attribute shipFrom (foreign key shipFromId)."""
 
 
 def _text_and_metadata(chunk: Any) -> tuple[str, dict[str, Any]]:

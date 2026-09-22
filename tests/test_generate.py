@@ -24,6 +24,11 @@ def test_answer_sends_system_prompt_context_and_question_then_returns_reply(monk
     assert system["role"] == "system" and system["content"] == generate.SYSTEM_PROMPT
     assert "answer only from" in system["content"].lower()
     assert "no direct relationship, but x is related via y" in system["content"].lower()
+    # every relevant near-miss must be enumerated, not just the first one found
+    assert "enumerate all" in system["content"].lower()
+    assert "not only the first or most obvious" in system["content"].lower()
+    # an infrastructure/tenant note must be surfaced when present, not silently dropped
+    assert "note" in system["content"].lower() and "infrastructure/tenant" in system["content"].lower()
     assert user["role"] == "user"
     assert "Branch has a many-to-one relationship to Bank." in user["content"]
     assert "Account is an entity in the banking layer." in user["content"]
