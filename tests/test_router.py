@@ -104,7 +104,12 @@ def test_single_entity_question_does_not_call_relations_between_and_uses_vector_
     context = router.retrieve("What are the attributes of Account?", graph, collection=object())
 
     assert queries == [("What are the attributes of Account?", router.DEFAULT_K)]
-    assert context == [{"text": "Account is an entity in the banking layer.", "metadata": {"chunk_type": "entity"}}]
+    assert context == [
+        {
+            "text": "Account is an entity in the banking layer.",
+            "metadata": {"chunk_type": "entity", "source": router.SOURCE_VECTOR_SEARCH},
+        }
+    ]
 
 
 # --- context content, real corpus, mocked store_query ---------------------------

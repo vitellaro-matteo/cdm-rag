@@ -13,6 +13,7 @@ infrastructure note) into the context, on top of whatever vector search also fin
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from typing import Any
 
 from cdm_rag import generate
@@ -50,12 +51,22 @@ def detect_entity_pair(question: str, graph: Graph, names: list[str] | None = No
     return (ordered[0], ordered[1]) if len(ordered) == 2 else None
 
 
-def _edge_items(graph: Graph, edges: tuple[Edge, ...]) -> list[dict[str, Any]]:
+#: What produced a context item, in ``metadata["source"]`` -- lets a caller (e.g. the API's
+#: "sources" field) say *why* each item is there without re-deriving it from item order/text.
+SOURCE_DIRECT_EDGE = "direct_edge"
+SOURCE_NEAR_MISS = "near_miss"
+SOURCE_NOTE = "note"
+SOURCE_VECTOR_SEARCH = "vector_search"
+SOURCE_SECTION_HEADER = "section_header"
+
+
+def _edge_items(graph: Graph, edges: tuple[Edge, ...], source: str) -> list[dict[str, Any]]:
     items = []
     for edge in edges:
         chunk = build_relationship_chunk(graph, edge)
         meta = dict(chunk.to_dict()["metadata"])
         meta["is_audit"] = edge.is_audit  # not on RelationshipChunk: only non-audit edges get one
+        meta["source"] = source
         items.append({"text": chunk.text, "metadata": meta})
     return items
 
@@ -63,17 +74,17 @@ def _edge_items(graph: Graph, edges: tuple[Edge, ...]) -> list[dict[str, Any]]:
 def relations_context(graph: Graph, relations: EntityPairRelations) -> list[dict[str, Any]]:
     """``relations_between``'s full output, reformatted as generation-ready {"text", "metadata"}
     items: every direct edge (incl. audit), every near-miss, and any infrastructure note."""
-    items = _edge_items(graph, relations.edges)
-    items += _edge_items(graph, relations.a_outgoing_near_misses)
-    items += _edge_items(graph, relations.b_incoming_near_misses)
-    for note in (relations.a_note, relations.b_note):
+    items = _edge_items(graph, relations.edges, SOURCE_DIRECT_EDGE)
+    items += _edge_items(graph, relations.a_outgoing_near_misses, SOURCE_NEAR_MISS)
+    items += _edge_items(graph, relations.b_incoming_near_misses, SOURCE_NEAR_MISS)
+    for entity_name, note in ((relations.a_name, relations.a_note), (relations.b_name, relations.b_note)):
         if note:
-            items.append({"text": note, "metadata": {"chunk_type": "note"}})
+            items.append({"text": note, "metadata": {"chunk_type": "note", "source": SOURCE_NOTE, "entity": entity_name}})
     return items
 
 
 def _section_header(text: str) -> dict[str, Any]:
-    return {"text": text, "metadata": {"chunk_type": "section_header"}}
+    return {"text": text, "metadata": {"chunk_type": "section_header", "source": SOURCE_SECTION_HEADER}}
 
 
 def retrieve(question: str, graph: Graph, collection: Any, k: int = DEFAULT_K) -> list[dict[str, Any]]:
@@ -96,7 +107,7 @@ def retrieve(question: str, graph: Graph, collection: Any, k: int = DEFAULT_K) -
     vector_items: list[dict[str, Any]] = []
     for hit in store_query(collection, question, k=k):
         if hit.text not in seen_text:
-            vector_items.append({"text": hit.text, "metadata": dict(hit.metadata)})
+            vector_items.append({"text": hit.text, "metadata": {**dict(hit.metadata), "source": SOURCE_VECTOR_SEARCH}})
             seen_text.add(hit.text)
 
     if relation_items and vector_items:
@@ -114,6 +125,17 @@ def retrieve(question: str, graph: Graph, collection: Any, k: int = DEFAULT_K) -
     return vector_items
 
 
-def answer(question: str, graph: Graph, collection: Any, k: int = DEFAULT_K) -> str:
+@dataclass(frozen=True)
+class AnswerResult:
+    """Result of ``answer()``: the generated text plus the exact context it was grounded in,
+    so a caller (the API, a script) can show its work -- which entities/relationships/notes
+    were actually used -- rather than exposing only the final string."""
+
+    answer: str
+    context: list[dict[str, Any]] = field(default_factory=list)
+
+
+def answer(question: str, graph: Graph, collection: Any, k: int = DEFAULT_K) -> AnswerResult:
     """Route, retrieve, and generate: the single entry point tying the pipeline together."""
-    return generate.answer(question, retrieve(question, graph, collection, k=k))
+    context = retrieve(question, graph, collection, k=k)
+    return AnswerResult(answer=generate.answer(question, context), context=context)
