@@ -194,3 +194,43 @@ def test_monikered_names_are_never_overridden(tmp_path):
 def test_full_attribute_lookup_is_exact(graph):
     attrs = graph.attributes[banking(graph, "Account").entity_id]
     assert len(attrs) == 135 and len({a.name for a in attrs}) == 135
+
+
+# --- relations_between ---------------------------------------------------------
+
+
+def test_no_edges_between_contact_and_organization_surfaces_near_misses(graph):
+    # The headline "how does Contact relate to Organization?" case: Contact has no organizationId
+    # and Organization has no outgoing edges in this graph (only seed entities are expanded), so
+    # the only edges into Organization at all are 11 audit organizationId edges from banking
+    # entities, none of which is Contact. There is no direct link in either direction.
+    r = graph.relations_between("Contact", "Organization")
+    assert r.has_edges is False
+    assert r.edges == ()
+    assert r.a_ids == tuple(sorted(n.entity_id for n in graph.find("Contact")))
+    assert len(r.a_ids) == 4  # banking, CRM base, Foundation, Core
+    assert r.b_ids == tuple(n.entity_id for n in graph.find("Organization"))
+
+    near = {(graph.nodes[e.from_id].name, e.attribute): [graph.nodes[i].name for i in e.to_ids] for e in r.a_outgoing_near_misses}
+    assert near[("Contact", "employer")] == ["Account"]
+    assert near[("Contact", "parentCustomer")] == ["Account", "Contact"]
+    assert not any(e.is_audit for e in r.a_outgoing_near_misses)  # near-misses are non-audit only
+
+    # Organization has no non-audit incoming edges either: its only incoming edges are audit.
+    assert r.b_incoming_near_misses == ()
+    assert graph.incoming(r.b_ids[0], include_audit=True) != ()
+    assert all(e.is_audit for e in graph.incoming(r.b_ids[0], include_audit=True))
+
+
+def test_direct_edges_between_branch_and_bank_include_audit_and_both_directions(graph):
+    r = graph.relations_between("Branch", "Bank")
+    assert r.has_edges is True
+    assert r.a_outgoing_near_misses == () and r.b_incoming_near_misses == ()  # only populated when has_edges is False
+    non_audit = [e for e in r.edges if not e.is_audit]
+    assert len(non_audit) == 1
+    edge = non_audit[0]
+    assert graph.nodes[edge.from_id].name == "Branch" and edge.attribute == "bank"
+    assert [graph.nodes[i].name for i in edge.to_ids] == ["Bank"]
+    # order-independent: same result querying "Bank", "Branch"
+    reverse = graph.relations_between("Bank", "Branch")
+    assert {e.edge_id for e in reverse.edges} == {e.edge_id for e in r.edges}

@@ -155,6 +155,50 @@ class Graph:
     def find(self, name: str, layer: str | None = None) -> list[EntityNode]:
         return [n for n in self.nodes.values() if n.name == name and (layer is None or n.layer == layer)]
 
+    def relations_between(self, name_a: str, name_b: str) -> "EntityPairRelations":
+        """Direct edges between every node named ``name_a`` and every node named ``name_b``
+        (both directions, audit edges included, since "is there any link at all" is the
+        question). When there are none, also return near-misses: ``name_a``'s own non-audit
+        outgoing edges and ``name_b``'s own non-audit incoming edges — structured data a caller
+        (e.g. an LLM prompt) can turn into "no direct relationship, but X is related via Y"."""
+        a_ids = tuple(sorted(n.entity_id for n in self.find(name_a)))
+        b_ids = tuple(sorted(n.entity_id for n in self.find(name_b)))
+        a_set, b_set = set(a_ids), set(b_ids)
+        edges = tuple(
+            e
+            for e in self.edges.values()
+            if (e.from_id in a_set and b_set.intersection(e.to_ids)) or (e.from_id in b_set and a_set.intersection(e.to_ids))
+        )
+        a_near = b_near = ()
+        if not edges:
+            a_near = tuple(e for i in a_ids for e in self.outgoing(i))
+            b_near = tuple(e for i in b_ids for e in self.incoming(i))
+        return EntityPairRelations(
+            a_name=name_a,
+            b_name=name_b,
+            a_ids=a_ids,
+            b_ids=b_ids,
+            edges=edges,
+            has_edges=bool(edges),
+            a_outgoing_near_misses=a_near,
+            b_incoming_near_misses=b_near,
+        )
+
+
+@dataclass(frozen=True)
+class EntityPairRelations:
+    """Result of ``Graph.relations_between``. ``a_ids``/``b_ids`` are every node (any layer)
+    matching that name; near-misses are populated only when ``has_edges`` is False."""
+
+    a_name: str
+    b_name: str
+    a_ids: tuple[str, ...]
+    b_ids: tuple[str, ...]
+    edges: tuple[Edge, ...]
+    has_edges: bool
+    a_outgoing_near_misses: tuple[Edge, ...] = ()
+    b_incoming_near_misses: tuple[Edge, ...] = ()
+
 
 def entities_in(corpus: Corpus, directory: str) -> list[EntityRef]:
     """Every entity defined in the unversioned entity documents directly inside ``directory``."""
