@@ -27,6 +27,7 @@ printed for you to read.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import time
@@ -44,6 +45,11 @@ from cdm_rag.store import open_or_build_index  # noqa: E402
 from cdm_rag import router  # noqa: E402
 
 REPORT_PATH = Path(__file__).resolve().parents[1] / "eval_results.md"
+#: Every real-API QuestionResult ever produced by any run (full or range-limited), keyed by
+#: question number, accumulated across invocations -- lets `--report` assemble one full report
+#: out of separate runs without re-asking a question a prior run already answered for real. See
+#: load_raw_results/save_raw_results.
+RAW_RESULTS_PATH = Path(__file__).resolve().parents[1] / "eval_results_raw.json"
 
 
 @dataclass
@@ -125,10 +131,55 @@ NEGATION_PHRASES = [
     "no entity", "cannot find", "can't find", "couldn't find", "not in the", "isn't in the",
     "not defined", "unable to find", "no information", "not mentioned", "not available",
     "does not contain", "doesn't contain", "no description of", "not named", "no mention of",
-    "not listed", "not included",
+    "not listed", "not included", "does not include",
 ]
+# ^ "does not include" added after a real Q7 run: the model correctly declined the fabricated
+# CryptoWallet entity ("The provided context does not include any description of a CryptoWallet
+# entity... there is no CryptoWallet entity described") but that exact phrasing matched none of
+# the phrases above, so check_q7 reported FAIL against a genuinely correct answer -- a check
+# false-negative, not a model or pipeline defect. Re-verified against that exact captured answer
+# text below (no new API call), not just asserted.
 
 NO_RELATIONSHIP_PHRASES = ["no direct relationship", "no relationship", "does not relate", "not related"]
+
+#: Words an answer is very unlikely to end on if it finished naturally -- a real, observed signal
+#: of mid-clause truncation, not a hypothetical: Q11's original real run ended with "...
+#: **Relationship (foreign-key) attributes** - the", cut off by the max_tokens cap. Deliberately
+#: short and conservative -- see looks_truncated's docstring for why this is a heuristic, not
+#: a completeness proof.
+DANGLING_ENDING_WORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "with", "by", "for", "is", "are",
+    "from", "as", "that", "this", "these", "those", "its", "their",
+}
+
+
+def looks_truncated(text: str) -> str | None:
+    """Heuristic only -- NOT a proof of completeness or truncation, and this is a real, named gap
+    in what "completeness" meant across this eval script before now: every existing check here
+    verifies that some real fact is PRESENT in the answer, never that the answer wasn't simply cut
+    off mid-sentence by the max_tokens cap. Q11's original real run passed both of check_q11's
+    other checks (a real attribute was named early on) while its answer ended, verbatim, on "...
+    **Relationship (foreign-key) attributes** - the" -- genuinely incomplete, and nothing here
+    caught it. This checks only how the text ENDS: a dangling connector word (see
+    DANGLING_ENDING_WORDS) or no normal closing punctuation/character at all. Returns a short
+    description of what looked wrong, or None if the ending looks normal. A complete answer could
+    still end in a way this doesn't anticipate, and a truncated one could in principle land on a
+    period -- treat a None result as "no truncation signal found", not "provably complete"."""
+    stripped = text.rstrip()
+    if not stripped:
+        return "answer is empty"
+    # Strip trailing markdown emphasis/code markers first -- "...as expected.**" is a normal,
+    # complete sentence wrapped in bold, not truncated, even though the literal last character is
+    # "*". Found via real false positives on this exact fix's first pass (Q6/Q18 both end
+    # "<real sentence>.**").
+    core = stripped.rstrip("*_`") or stripped
+    words = re.findall(r"[A-Za-z']+", core)
+    if words and words[-1].lower() in DANGLING_ENDING_WORDS:
+        return f"answer ends on a dangling connector word ({words[-1]!r})"
+    if core[-1] not in ".!?)]}\"'|":
+        return f"answer does not end with normal closing punctuation (ends with {core[-1]!r})"
+    return None
+
 
 OUT_OF_SCOPE_PHRASES = [
     "out of scope", "outside the scope", "don't have", "do not have", "not have access",
@@ -150,12 +201,21 @@ def check_q1(gt: dict[str, Any], r: QuestionResult) -> list[Check]:
     # not the summarized vector-search entity chunk -- see router.detect_single_entity.
     got_lookup = has_item(r.context, source="entity_lookup", entity="Account", layer="banking")
     mentioned = count_mentions(r.answer, sorted(gt["account_own_attrs"]))
+    # An "enumerate everything" style question (like Q11's) -- real risk of hitting the
+    # max_tokens cap mid-list; see looks_truncated's docstring for what this check can and can't
+    # tell you.
+    truncated = looks_truncated(r.answer)
     return [
         Check("context has a full entity_lookup for the banking Account (not the Core-layer one)", got_lookup),
         Check(
             "answer names a real Account attribute",
             bool(mentioned),
             f"mentioned: {mentioned}" if mentioned else f"expected one of {sorted(gt['account_own_attrs'])}",
+        ),
+        Check(
+            "answer does not look truncated mid-sentence (heuristic -- see looks_truncated)",
+            truncated is None,
+            truncated or "",
         ),
     ]
 
@@ -235,11 +295,18 @@ def check_q7(gt: dict[str, Any], r: QuestionResult) -> list[Check]:
 
 def check_q9(gt: dict[str, Any], r: QuestionResult) -> list[Check]:
     mentioned = count_mentions(r.answer, gt["banking_entity_names"])
+    # An enumeration question (every banking entity) -- same truncation risk class as Q1/Q11.
+    truncated = looks_truncated(r.answer)
     return [
         Check(
-            "answer names real banking entities, none invented (grounding only -- completeness is NOT checked)",
+            "answer names real banking entities, none invented (grounding only -- exhaustiveness of the list is NOT checked, only that it isn't cut off -- see next check)",
             len(mentioned) >= 3,
             f"{len(mentioned)} real banking entities named: {mentioned}",
+        ),
+        Check(
+            "answer does not look truncated mid-sentence (heuristic -- see looks_truncated)",
+            truncated is None,
+            truncated or "",
         ),
     ]
 
@@ -269,6 +336,11 @@ def check_q11(gt: dict[str, Any], r: QuestionResult) -> list[Check]:
     detail = router.entity_detail(graph, node)
     collision = router._ancestor_layer_collision(r.question, detail)
     mentioned = count_mentions(r.answer, sorted(gt["account_own_attrs"]))
+    # This is the question that actually truncated in a real run (2093/3000-token miss became a
+    # clean 3000/3000-token cutoff on a later run, mid-sentence, when the model happened to pick
+    # a markdown-table format) -- everything above still passed that run, because it only checks
+    # that a real fact is present, never that the answer wasn't cut off. See looks_truncated.
+    truncated = looks_truncated(r.answer)
     return [
         Check(
             "question does not trigger the ancestor-layer-collision disambiguation path (unmodified system prompt)",
@@ -279,6 +351,11 @@ def check_q11(gt: dict[str, Any], r: QuestionResult) -> list[Check]:
             "answer names a real Account attribute",
             bool(mentioned),
             f"mentioned: {mentioned}" if mentioned else f"expected one of {sorted(gt['account_own_attrs'])}",
+        ),
+        Check(
+            "answer does not look truncated mid-sentence (heuristic -- see looks_truncated; this is the check that would have caught the real Q11 truncation)",
+            truncated is None,
+            truncated or "",
         ),
     ]
 
@@ -396,6 +473,32 @@ QUESTIONS: list[tuple[str, Callable[[dict[str, Any], QuestionResult], list[Check
 ]
 
 
+#: Capability groupings for the report (see README's Evaluation section). Purely a reporting
+#: concern -- does not change QUESTIONS, question text, or any check's logic. Each category's
+#: question numbers are listed in the exact order they appear within that category's report
+#: section. Every number 1..len(QUESTIONS) must appear in exactly one category (checked at import
+#: time below, not left to silently drift as questions are added).
+CATEGORY_QUESTIONS: dict[str, list[int]] = {
+    "Entity attributes": [1, 6, 11, 12],
+    "Direct relationships": [3, 10],
+    "No-relationship handling": [2],
+    "Reverse / multi-hop traversal": [4, 15, 16],
+    "Attribute-level lookup": [5],
+    "Hallucination resistance (false premises)": [7, 13, 14, 17],
+    "Scope boundaries": [9, 20],
+    "Comparative / open-ended reasoning": [8],
+    "System self-awareness": [18, 19],
+}
+
+_categorized = sorted(n for nums in CATEGORY_QUESTIONS.values() for n in nums)
+_expected = list(range(1, len(QUESTIONS) + 1))
+if _categorized != _expected:
+    raise RuntimeError(
+        f"CATEGORY_QUESTIONS must cover exactly Q1..Q{len(QUESTIONS)} once each; "
+        f"got {_categorized}, expected {_expected}"
+    )
+
+
 # --- run + report ---------------------------------------------------------------------------------
 
 
@@ -467,6 +570,52 @@ def run_all(
     return results
 
 
+def _check_to_dict(c: Check) -> dict[str, Any]:
+    return {"label": c.label, "passed": c.passed, "detail": c.detail}
+
+
+def _check_from_dict(d: dict[str, Any]) -> Check:
+    return Check(label=d["label"], passed=d["passed"], detail=d.get("detail", ""))
+
+
+def _result_to_dict(r: QuestionResult) -> dict[str, Any]:
+    return {
+        "number": r.number, "question": r.question, "answer": r.answer, "context": r.context,
+        "elapsed": r.elapsed, "timing": r.timing, "checks": [_check_to_dict(c) for c in r.checks],
+        "manual": r.manual,
+    }
+
+
+def _result_from_dict(d: dict[str, Any]) -> QuestionResult:
+    return QuestionResult(
+        number=d["number"], question=d["question"], answer=d["answer"], context=d["context"],
+        elapsed=d["elapsed"], timing=d.get("timing", {}),
+        checks=[_check_from_dict(c) for c in d.get("checks", [])], manual=d.get("manual", False),
+    )
+
+
+def load_raw_results() -> dict[int, QuestionResult]:
+    """Every real-API result saved by a past run (any range), keyed by question number. Empty if
+    RAW_RESULTS_PATH doesn't exist yet -- a fresh clone has never run the eval script."""
+    if not RAW_RESULTS_PATH.exists():
+        return {}
+    data = json.loads(RAW_RESULTS_PATH.read_text(encoding="utf-8"))
+    return {int(k): _result_from_dict(v) for k, v in data.items()}
+
+
+def save_raw_results(results: list[QuestionResult]) -> dict[int, QuestionResult]:
+    """Merges ``results`` into the accumulating store (by question number, newest run for a given
+    number wins) and persists it to RAW_RESULTS_PATH. Returns the full merged store."""
+    merged = load_raw_results()
+    for r in results:
+        merged[r.number] = r
+    RAW_RESULTS_PATH.write_text(
+        json.dumps({str(k): _result_to_dict(v) for k, v in sorted(merged.items())}, indent=2),
+        encoding="utf-8",
+    )
+    return merged
+
+
 def _source_lines(context: list[dict[str, Any]]) -> list[str]:
     lines = []
     for item in context:
@@ -528,15 +677,84 @@ def render_performance_table(results: list[QuestionResult]) -> str:
     return "\n".join(lines)
 
 
+def _category_summary_line(category: str, members: list[QuestionResult]) -> str:
+    """One compact coverage line for ``category``, e.g. "Entity attributes: 3/4 passed, 1
+    needing manual review" -- the numerator/denominator intentionally mixes scopes (passed count
+    among the category's automated checks, over the category's total question count, auto +
+    manual), matching how a reader wants to scan this: "how much of this capability is covered,
+    and how much of that coverage came back clean." A category with zero automated questions
+    (e.g. purely meta/self-awareness questions) gets a distinct phrasing rather than a misleading
+    "0/1 passed", since there's no automated check to have passed or failed."""
+    total = len(members)
+    auto = [r for r in members if not r.manual]
+    manual = [r for r in members if r.manual]
+    if not auto:
+        return f"- {category}: {len(manual)} needing manual review (no automated checks in this category)"
+    passed = [r for r in auto if r.passed]
+    failed = [r for r in auto if not r.passed]
+    bits = [f"{len(passed)}/{total} passed"]
+    if failed:
+        bits.append(f"{len(failed)} failed")
+    if manual:
+        bits.append(f"{len(manual)} needing manual review")
+    return f"- {category}: " + ", ".join(bits)
+
+
+def render_category_summary(results: list[QuestionResult]) -> list[str]:
+    """One line per category present in ``results`` (in ``CATEGORY_QUESTIONS`` order), skipping a
+    category with zero members in ``results`` -- relevant for a range-limited run, whose report
+    should only claim coverage of what it actually asked."""
+    by_number = {r.number: r for r in results}
+    lines = []
+    for category, numbers in CATEGORY_QUESTIONS.items():
+        members = [by_number[n] for n in numbers if n in by_number]
+        if members:
+            lines.append(_category_summary_line(category, members))
+    return lines
+
+
+def _render_question_detail(r: QuestionResult) -> list[str]:
+    status = "NEEDS HUMAN REVIEW" if r.manual else ("PASS" if r.passed else "FAIL")
+    lines = [f"### Q{r.number}: {r.question}", "", f"**Status:** {status}  (**{r.elapsed:.1f}s**)", ""]
+    lines.append("**Answer:**")
+    lines.append("")
+    lines.append("> " + r.answer.replace("\n", "\n> "))
+    lines.append("")
+    lines.append(f"**Sources / context** ({len(r.context)} items):")
+    lines.append("")
+    lines.extend(_source_lines(r.context))
+    lines.append("")
+    if r.manual:
+        lines.append("**Automated checks:** none -- read the answer above and judge for yourself.")
+    else:
+        lines.append("**Automated checks:**")
+        for c in r.checks:
+            box = "x" if c.passed else " "
+            detail = f" -- {c.detail}" if c.detail else ""
+            lines.append(f"- [{box}] {c.label}{detail}")
+    lines.append("")
+    return lines
+
+
 def render_report(results: list[QuestionResult]) -> str:
     verified = [r for r in results if not r.manual]
     passed = [r for r in verified if r.passed]
     manual = [r for r in results if r.manual]
+    by_number = {r.number: r for r in results}
 
     lines = [
         "# cdm-rag evaluation report",
         "",
-        f"**Summary: {len(verified)}/{len(results)} automatically verified ({len(passed)} passed, "
+        "## Category summary",
+        "",
+        "Coverage by capability, not just a flat pass count -- see README's Evaluation section "
+        "for what each category is meant to test.",
+        "",
+    ]
+    lines += render_category_summary(results)
+    lines += [
+        "",
+        f"**Overall: {len(verified)}/{len(results)} automatically verified ({len(passed)} passed, "
         f"{len(verified) - len(passed)} failed), {len(manual)} needing manual review.**",
         "",
         "## Performance profile",
@@ -548,34 +766,49 @@ def render_report(results: list[QuestionResult]) -> str:
         render_performance_table(results),
         "",
     ]
-    for r in results:
-        status = "NEEDS HUMAN REVIEW" if r.manual else ("PASS" if r.passed else "FAIL")
-        lines.append(f"## Q{r.number}: {r.question}")
+    for category, numbers in CATEGORY_QUESTIONS.items():
+        members = [by_number[n] for n in numbers if n in by_number]
+        if not members:
+            continue
+        lines.append(f"## Category: {category}")
         lines.append("")
-        lines.append(f"**Status:** {status}  (**{r.elapsed:.1f}s**)")
-        lines.append("")
-        lines.append("**Answer:**")
-        lines.append("")
-        lines.append("> " + r.answer.replace("\n", "\n> "))
-        lines.append("")
-        lines.append(f"**Sources / context** ({len(r.context)} items):")
-        lines.append("")
-        lines.extend(_source_lines(r.context))
-        lines.append("")
-        if r.manual:
-            lines.append("**Automated checks:** none -- read the answer above and judge for yourself.")
-        else:
-            lines.append("**Automated checks:**")
-            for c in r.checks:
-                box = "x" if c.passed else " "
-                detail = f" -- {c.detail}" if c.detail else ""
-                lines.append(f"- [{box}] {c.label}{detail}")
-        lines.append("")
+        for r in members:
+            lines += _render_question_detail(r)
     return "\n".join(lines)
+
+
+def _print_summary(results: list[QuestionResult]) -> None:
+    verified = [r for r in results if not r.manual]
+    passed = [r for r in verified if r.passed]
+    manual = [r for r in results if r.manual]
+    print(f"\n{len(verified)}/{len(results)} automatically verified ({len(passed)} passed, {len(verified) - len(passed)} failed), {len(manual)} needing manual review.")
+
+
+def _assemble_report() -> None:
+    """Renders eval_results.md purely from the accumulated raw store (RAW_RESULTS_PATH) -- no API
+    calls at all. Lets one full categorized report be built out of separate, range-limited runs
+    without re-asking a question a prior run already answered for real. Invoked with
+    `python scripts/eval.py --report`."""
+    store = load_raw_results()
+    results = sorted(store.values(), key=lambda r: r.number)
+    missing = [n for n in range(1, len(QUESTIONS) + 1) if n not in store]
+
+    report = render_report(results)
+    REPORT_PATH.write_text(report, encoding="utf-8")
+
+    print(f"Assembled report from {len(results)}/{len(QUESTIONS)} previously-run questions (no API calls made).")
+    if missing:
+        print(f"Missing (never saved to {RAW_RESULTS_PATH.name}): {missing}")
+    _print_summary(results)
+    print(f"\nReport written to {REPORT_PATH}")
 
 
 def main() -> None:
     args = sys.argv[1:]
+    if args[:1] == ["--report"]:
+        _assemble_report()
+        return
+
     start = int(args[0]) if len(args) >= 1 else 1
     end = int(args[1]) if len(args) >= 2 else len(QUESTIONS)
     subset = QUESTIONS[start - 1 : end]
@@ -593,13 +826,11 @@ def main() -> None:
     print("done.\n")
 
     results = run_all(graph, collection, subset, start_index=start)
+    save_raw_results(results)  # accumulate into the merged store regardless of range, for --report later
     report = render_report(results)
     report_path.write_text(report, encoding="utf-8")
 
-    verified = [r for r in results if not r.manual]
-    passed = [r for r in verified if r.passed]
-    manual = [r for r in results if r.manual]
-    print(f"\n{len(verified)}/{len(results)} automatically verified ({len(passed)} passed, {len(verified) - len(passed)} failed), {len(manual)} needing manual review.")
+    _print_summary(results)
     print("\nPerformance profile:")
     print(render_performance_table(results))
     print(f"\nReport written to {report_path}")
