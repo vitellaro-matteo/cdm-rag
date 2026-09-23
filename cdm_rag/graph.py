@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 import posixpath
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, NamedTuple
@@ -55,6 +55,11 @@ BANKING_DIR = "core/applicationCommon/foundationCommon/crmCommon/accelerators/fi
 # can have a dozen-plus unrelated edges; passing all of them as "near misses" to an LLM buries
 # the couple of actually relevant ones in noise instead of surfacing them.
 NEAR_MISS_LIMIT = 5
+
+# Default hop cap for Graph.find_path -- small enough that a question with no real answer
+# doesn't search the entire graph, generous enough for every real path this corpus has been
+# found to need (the longest verified so far, Collateral -> Bank, is 3 hops).
+DEFAULT_MAX_HOPS = 4
 
 # First match wins. Labels appear in display names: "Account (CRM base)".
 _LAYERS = (
@@ -104,6 +109,18 @@ class EdgeTarget(NamedTuple):
     attribute: str | None
     resolved_by: str = RESOLVED_BY_IMPORT_ORDER  # "seed_layer" | "import_order"
     import_order_id: str | None = None  # what strict CDM import order picks (== entity_id unless deviated)
+
+
+class PathHop(NamedTuple):
+    """One edge of a ``Graph.find_path`` result, oriented in the direction the path actually
+    travels (``from_id`` -> ``to_id``) -- which may be against the edge's own FK direction, since
+    ``find_path`` treats the graph as undirected (see its docstring). ``edge`` is the underlying
+    ``Edge``; render a hop's label from ``edge.attribute``, not from ``edge.from_id``/``to_ids``,
+    since those describe the edge's storage direction, not this hop's traversal direction."""
+
+    edge: "Edge"
+    from_id: str
+    to_id: str
 
 
 @dataclass(frozen=True)
@@ -232,6 +249,63 @@ class Graph:
         scored = sorted(edges, key=lambda e: self._near_miss_score(e, missing_name), reverse=True)
         relevant = [e for e in scored if any(self._near_miss_score(e, missing_name))]
         return tuple(relevant[:NEAR_MISS_LIMIT])
+
+    def _path_neighbors(self, node_id: str) -> list[tuple[Edge, str]]:
+        """(edge, neighbor_id) for every non-audit edge touching ``node_id``, from either side --
+        outgoing (this node is ``from_id``, possibly several targets for a polymorphic edge) and
+        incoming (this node is one of ``to_ids``, the neighbor is ``from_id``). ``find_path``
+        treats the graph as undirected: an edge's own FK direction is a storage detail (which
+        side happened to declare the foreign key), not a statement about which direction a path
+        is allowed to use it -- e.g. Branch declares the FK to Bank, but a path from Bank back to
+        Branch is exactly as real a connection."""
+        out = [(e, to_id) for e in self.outgoing(node_id) for to_id in dict.fromkeys(e.to_ids)]
+        out += [(e, e.from_id) for e in self.incoming(node_id)]
+        return out
+
+    def find_path(self, name_a: str, name_b: str, max_hops: int = DEFAULT_MAX_HOPS) -> tuple["PathHop", ...] | None:
+        """Shortest chain of non-audit edges connecting any node named ``name_a`` to any node
+        named ``name_b`` (same audit exclusion as ``relations_between``'s default), or ``None``
+        if no such chain exists within ``max_hops`` edges. Breadth-first search, not Dijkstra or
+        A*: every edge here is equally meaningful -- there is no real notion of "distance"
+        between two entities in this schema -- so a weighted-shortest-path algorithm would add
+        complexity without adding any real capability; BFS already finds the shortest chain by
+        hop count, which is the only ordering that means anything here. ``max_hops`` bounds the
+        search so a question with no real answer doesn't walk the entire graph -- reaching it
+        without finding ``name_b`` returns ``None``, the same result as if no path existed at all
+        (it's a caller-visible cap, not silently swapped for "no path"; see its default's
+        comment). This is a last-resort fallback for the router (see ``router._route``), not a
+        replacement for ``relations_between``'s direct-edge/near-miss logic -- it only ever
+        matters when that logic has already come up completely empty."""
+        a_ids = {n.entity_id for n in self.find(name_a)}
+        b_ids = {n.entity_id for n in self.find(name_b)}
+        if not a_ids or not b_ids:
+            return None
+        if a_ids & b_ids:
+            return ()  # the same entity named on both sides -- a zero-hop "path"
+
+        visited = set(a_ids)
+        parent: dict[str, tuple[str, Edge]] = {}
+        queue: deque[tuple[str, int]] = deque((i, 0) for i in a_ids)
+        while queue:
+            node_id, depth = queue.popleft()
+            if node_id in b_ids:
+                hops: list[PathHop] = []
+                cur = node_id
+                while cur in parent:
+                    prev, edge = parent[cur]
+                    hops.append(PathHop(edge=edge, from_id=prev, to_id=cur))
+                    cur = prev
+                hops.reverse()
+                return tuple(hops)
+            if depth >= max_hops:
+                continue
+            for edge, neighbor_id in self._path_neighbors(node_id):
+                if neighbor_id in visited:
+                    continue
+                visited.add(neighbor_id)
+                parent[neighbor_id] = (node_id, edge)
+                queue.append((neighbor_id, depth + 1))
+        return None
 
     def _infrastructure_note(self, name: str, ids: tuple[str, ...]) -> str | None:
         """A plain-language note when every node named ``name`` has zero non-audit (business)

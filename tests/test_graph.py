@@ -255,6 +255,58 @@ def test_direct_edges_between_branch_and_bank_include_audit_and_both_directions(
     assert {e.edge_id for e in reverse.edges} == {e.edge_id for e in r.edges}
 
 
+# --- find_path: BFS multi-hop fallback (see router._route's narrow use of it) ------------------
+
+
+def test_find_path_collateral_to_bank_goes_through_financialproduct_and_branch(graph):
+    # Real ground truth, verified against this graph directly: no direct Collateral-Bank edge,
+    # but a genuine 3-hop path -- Collateral's only edge is to FinancialProduct, which has its
+    # own direct edge to Branch (independent of FinancialProduct's separate "customer" edge to
+    # Account/Contact, which does NOT lead to Bank), and Branch has the direct edge to Bank.
+    r = graph.relations_between("Collateral", "Bank")
+    assert r.has_edges is False  # confirms this exercises the fallback, not the direct-edge path
+
+    path = graph.find_path("Collateral", "Bank")
+    assert path is not None
+    assert [h.edge.attribute for h in path] == ["financialProduct", "branch", "bank"]
+    hop_names = [graph.nodes[path[0].from_id].name] + [graph.nodes[h.to_id].name for h in path]
+    assert hop_names == ["Collateral", "FinancialProduct", "Branch", "Bank"]
+    # each hop's to_id chains into the next hop's from_id -- a real connected walk, not
+    # independently-found edges stitched together after the fact
+    assert path[0].to_id == path[1].from_id
+    assert path[1].to_id == path[2].from_id
+
+
+def test_find_path_contact_to_organization_is_none_at_any_reachable_hop_count(graph):
+    # The project's headline "no relationship" result: confirms multi-hop doesn't change it.
+    # Organization has zero non-audit edges at all (in or out) anywhere in this graph -- so it is
+    # genuinely unreachable via find_path's non-audit BFS, not merely "not found within 4 hops."
+    assert graph.find_path("Contact", "Organization") is None
+    assert graph.find_path("Contact", "Organization", max_hops=50) is None  # not a cap artifact
+
+
+def test_find_path_branch_to_bank_is_the_existing_direct_edge_not_duplicated(graph):
+    # Multi-hop must not break or re-derive the simple, already-working one-hop case.
+    path = graph.find_path("Branch", "Bank")
+    assert path is not None
+    assert len(path) == 1
+    assert path[0].edge.attribute == "bank"
+    assert graph.nodes[path[0].from_id].name == "Branch"
+    assert graph.nodes[path[0].to_id].name == "Bank"
+
+
+def test_find_path_respects_the_max_hops_cap(graph):
+    # The real Collateral->Bank path is 3 hops; capping below that must return None, not a
+    # truncated/wrong path -- confirms the cap is a real search boundary, not decorative.
+    assert graph.find_path("Collateral", "Bank", max_hops=2) is None
+    assert graph.find_path("Collateral", "Bank", max_hops=3) is not None
+
+
+def test_find_path_unknown_entity_name_returns_none(graph):
+    assert graph.find_path("Collateral", "NoSuchEntity") is None
+    assert graph.find_path("NoSuchEntity", "Bank") is None
+
+
 def _poly_fk(name, targets, fk):
     return {
         "entity": {"entityReference": {"entityName": "Alt", "hasAttributes": [

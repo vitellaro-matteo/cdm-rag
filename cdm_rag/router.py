@@ -47,6 +47,7 @@ from cdm_rag.graph import (
     EntityDetail,
     EntityPairRelations,
     Graph,
+    PathHop,
     RelationshipInfo,
     attribute_detail,
     entity_detail,
@@ -135,6 +136,7 @@ SOURCE_ENTITY_LOOKUP = "entity_lookup"
 SOURCE_ATTRIBUTE_LOOKUP = "attribute_lookup"
 SOURCE_VECTOR_SEARCH = "vector_search"
 SOURCE_SECTION_HEADER = "section_header"
+SOURCE_MULTI_HOP_PATH = "multi_hop_path"
 
 
 def _edge_items(graph: Graph, edges: tuple[Edge, ...], source: str) -> list[dict[str, Any]]:
@@ -158,6 +160,39 @@ def relations_context(graph: Graph, relations: EntityPairRelations) -> list[dict
         if note:
             items.append({"text": note, "metadata": {"chunk_type": "note", "source": SOURCE_NOTE, "entity": entity_name}})
     return items
+
+
+def _format_path(graph: Graph, hops: tuple[PathHop, ...]) -> str:
+    def label(node_id: str) -> str:
+        node = graph.nodes.get(node_id)
+        return node.display_name if node else node_id
+
+    parts = [label(hops[0].from_id)]
+    for hop in hops:
+        parts.append(f"-> {label(hop.to_id)} (via {hop.edge.attribute})")
+    return " ".join(parts)
+
+
+def path_context(graph: Graph, name_a: str, name_b: str, hops: tuple[PathHop, ...]) -> list[dict[str, Any]]:
+    """``graph.find_path``'s result as ONE generation-ready {"text", "metadata"} item -- a single
+    compact sentence naming every hop, not one item per hop (that's exactly the context-flooding
+    problem ``_ranked_near_misses`` was built to fix once already, see the module docstring's
+    near-miss rationale; a multi-hop path is a last-resort fallback, not a reason to reintroduce
+    it). Explicitly labeled as a multi-hop path, not a direct relationship, so generation doesn't
+    present indirection as if it were a direct edge."""
+    text = (
+        f"No direct relationship or near-miss connects {name_a} and {name_b}, but a multi-hop "
+        f"path does, {len(hops)} hop(s): {_format_path(graph, hops)}. This is NOT a direct "
+        f"relationship -- state that plainly, then describe this path as the indirect connection."
+    )
+    meta = {
+        "chunk_type": "multi_hop_path",
+        "source": SOURCE_MULTI_HOP_PATH,
+        "entity_a": name_a,
+        "entity_b": name_b,
+        "hops": len(hops),
+    }
+    return [{"text": text, "metadata": meta}]
 
 
 def _own_attributes_lines(detail: EntityDetail) -> list[str]:
@@ -343,6 +378,14 @@ def _route(
         with _measure(timing, "graph_lookup"):
             relations = graph.relations_between(*pair)
             items = relations_context(graph, relations)
+            # Last-resort fallback, kept narrow: only attempted when relations_between's own
+            # direct-edge and (already ranked/filtered) near-miss logic came up completely empty
+            # on both sides -- never when either found something, so this can only ever add
+            # context, never compete with or override what already works (see graph.find_path).
+            if not relations.has_edges and not relations.a_outgoing_near_misses and not relations.b_incoming_near_misses:
+                hops = graph.find_path(*pair)
+                if hops:
+                    items = items + path_context(graph, pair[0], pair[1], hops)
         header = f"Direct schema lookup for {pair[0]} and {pair[1]} (the highest-confidence facts for this question):"
         return items, header, None, None
 

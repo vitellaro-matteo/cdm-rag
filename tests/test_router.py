@@ -146,6 +146,59 @@ def test_two_entity_question_calls_relations_between(monkeypatch):
     assert calls == [("Contact", "Organization")]
 
 
+def test_multi_hop_fallback_fires_only_when_relations_between_found_nothing_at_all(monkeypatch):
+    from cdm_rag.graph import EntityPairRelations
+
+    graph = _tiny_graph("Collateral", "Bank")
+    monkeypatch.setattr(router, "store_query", lambda collection, text, k=router.DEFAULT_K: [])
+    monkeypatch.setattr(
+        graph,
+        "relations_between",
+        lambda a, b: EntityPairRelations(a_name=a, b_name=b, a_ids=(), b_ids=(), edges=(), has_edges=False),
+    )
+
+    class FakeEdge:
+        attribute = "financialProduct"
+
+    calls = []
+
+    def fake_find_path(a, b, max_hops=4):
+        calls.append((a, b))
+        return (router.PathHop(edge=FakeEdge(), from_id="collateral#1", to_id="bank#1"),)
+
+    monkeypatch.setattr(graph, "find_path", fake_find_path)
+
+    context = router.retrieve("What's the path from Collateral to Bank?", graph, collection=object())
+
+    assert calls == [("Collateral", "Bank")]  # only called because has_edges and both near-misses were empty
+    path_items = [c for c in context if c["metadata"].get("source") == router.SOURCE_MULTI_HOP_PATH]
+    assert len(path_items) == 1
+    assert "NOT a direct relationship" in path_items[0]["text"]
+
+
+def test_multi_hop_fallback_never_fires_when_a_near_miss_already_exists(monkeypatch):
+    from cdm_rag.graph import Edge, EdgeTarget, EntityPairRelations
+
+    graph = _tiny_graph("Contact", "Organization")
+    (contact_id,) = [n.entity_id for n in graph.nodes.values() if n.name == "Contact"]
+    fake_edge = Edge(
+        edge_id="e1", from_id=contact_id, attribute="employer", fk_name="employerId",
+        targets=(EdgeTarget(None, "Account", "accountId"),),  # unresolved target: fine, still renders
+        is_audit=False, is_polymorphic=False, fk_inferred=False, inherited_from=None,
+    )
+    monkeypatch.setattr(
+        graph,
+        "relations_between",
+        lambda a, b: EntityPairRelations(
+            a_name=a, b_name=b, a_ids=(), b_ids=(), edges=(), has_edges=False, a_outgoing_near_misses=(fake_edge,)
+        ),
+    )
+    monkeypatch.setattr(graph, "find_path", lambda a, b, max_hops=4: pytest.fail("find_path must not be called"))
+    monkeypatch.setattr(router, "store_query", lambda collection, text, k=router.DEFAULT_K: [])
+
+    router.retrieve("How does Contact relate to Organization?", graph, collection=object())  # must not raise
+
+
 def test_question_naming_no_known_entity_falls_back_to_plain_vector_search(monkeypatch):
     graph = _tiny_graph("Account", "Bank")
 
@@ -285,6 +338,23 @@ def test_contact_organization_context_has_both_near_misses_as_distinct_items(rea
     # the infrastructure note explaining *why* Organization has no relationship
     assert "no non-audit (business) relationships" in notes[0]["text"]
     assert "infrastructure/tenant" in notes[0]["text"]
+
+
+def test_contact_organization_context_never_includes_a_multi_hop_path_item(real_graph, monkeypatch):
+    # The non-negotiable regression check: Contact already has real near-misses against
+    # Organization (employer, parentCustomer -- see the test above), so find_path's fallback must
+    # never even be attempted here, and this context must be identical to before that fallback
+    # existed. Asserted two ways: the fallback's own trigger condition is false (checked directly
+    # against the real graph, not assumed), and no multi_hop_path item is present in the context
+    # a real question actually produces.
+    relations = real_graph.relations_between("Contact", "Organization")
+    assert relations.has_edges is False
+    assert relations.a_outgoing_near_misses != ()  # this is what keeps the fallback from firing
+
+    monkeypatch.setattr(router, "store_query", lambda collection, text, k=router.DEFAULT_K: [])
+    context = router.retrieve("How does Contact relate to Organization?", real_graph, collection=object())
+
+    assert not any(c["metadata"].get("source") == router.SOURCE_MULTI_HOP_PATH for c in context)
 
 
 def test_branch_bank_context_has_the_real_edge_and_no_near_misses(real_graph, monkeypatch):
@@ -513,6 +583,34 @@ def test_contact_organization_real_pipeline_message_reaches_the_llm_call(real_gr
     assert "via attribute employer" in user_content
     assert "via attribute parentCustomer" in user_content
     assert "infrastructure/tenant" in user_content
+
+
+def test_collateral_bank_real_pipeline_gets_the_multi_hop_path_as_a_labeled_fallback(real_graph, real_index):
+    # Q16 from the harder eval set. Ground truth (verified directly against the graph): no direct
+    # Collateral-Bank edge and no near-miss either (Collateral's only edge is to FinancialProduct,
+    # which doesn't lexically or structurally match "Bank"), so this exercises find_path as a real
+    # last resort, not relations_between's own logic -- confirmed explicitly, not just inferred
+    # from the context this produces.
+    relations = real_graph.relations_between("Collateral", "Bank")
+    assert relations.has_edges is False
+    assert relations.a_outgoing_near_misses == ()
+    assert relations.b_incoming_near_misses == ()
+
+    question = "What's the path from Collateral to Bank?"
+    context = router.retrieve(question, real_graph, real_index)
+
+    (path_item,) = [c for c in context if c["metadata"].get("source") == router.SOURCE_MULTI_HOP_PATH]
+    assert path_item["metadata"]["hops"] == 3
+    assert "NOT a direct relationship" in path_item["text"]
+    assert "Collateral" in path_item["text"]
+    assert "Bank" in path_item["text"]
+    assert "FinancialProduct" in path_item["text"]
+    assert "Branch" in path_item["text"]
+    assert "via financialProduct" in path_item["text"]
+    assert "via branch" in path_item["text"]
+    assert "via bank" in path_item["text"]
+    # exactly one compact item for the whole path, not one per hop (see path_context's docstring)
+    assert sum(1 for c in context if c["metadata"].get("source") == router.SOURCE_MULTI_HOP_PATH) == 1
 
 
 def test_account_core_attributes_real_pipeline_excludes_other_layer_duplicates(real_graph, real_index):
