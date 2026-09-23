@@ -214,7 +214,7 @@ Run the API:
 uvicorn cdm_rag.api:app --host 0.0.0.0 --port 8000
 ```
 
-Run the tests (161 tests; anything needing the real corpus skips cleanly with a clear message if
+Run the tests (176 tests; anything needing the real corpus skips cleanly with a clear message if
 `CDM_CORPUS_PATH` isn't set to a real checkout):
 
 ```bash
