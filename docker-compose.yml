@@ -1,5 +1,6 @@
-# Build (needs the CDM corpus as a named build context; see Dockerfile's header comment):
-#   docker compose build --build-context corpus=../CDM/schemaDocuments
+# Build (standard single-context build -- the corpus subset is committed at corpus_subset/, see
+# Dockerfile's header comment; no --build-context needed):
+#   docker compose build
 # Run (reads GROQ_API_KEY/LLM_MODEL from a local .env file -- never baked into the image):
 #   docker compose up
 #
@@ -11,14 +12,14 @@ services:
   cdm-rag:
     build:
       context: .
-      additional_contexts:
-        corpus: ../CDM/schemaDocuments
     image: cdm-rag:latest
     ports:
       - "8000:8000"
     environment:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - LLM_MODEL=${LLM_MODEL}
+      - DEMO_ACCESS_KEY=${DEMO_ACCESS_KEY:-}
+      - DEMO_RATE_LIMIT_PER_HOUR=${DEMO_RATE_LIMIT_PER_HOUR:-}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s

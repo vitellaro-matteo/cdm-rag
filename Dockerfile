@@ -1,33 +1,24 @@
-# Build context is this directory (cdm-rag/) alone. The CDM corpus lives OUTSIDE this repo, so
-# it's supplied as a separate named build context rather than by widening the primary context:
+# Build context is this directory (cdm-rag/) alone -- a single, standard `docker build .`, with
+# nothing external required. That was not always true: build_graph() only ever reads the ~200
+# corpus files (~12MB of the full corpus's ~970MB) an import/moniker/extendsEntity chain actually
+# asks for (see cdm_rag/inheritance.py's Corpus; it never scans the whole schemaDocuments tree),
+# and this was previously exploited by deriving that subset from an *external* second build
+# context (--build-context corpus=../CDM/schemaDocuments) at build time. That approach works with
+# local `docker build` but not with Render's standard single-context Docker builds, so the
+# derived subset is instead committed directly into this repo at corpus_subset/ (201 files,
+# ~12MB -- small enough to commit, and static: it only needs re-deriving if the CDM schema itself
+# changes). Re-derive and re-verify it with:
 #
-#   docker build --build-context corpus=../CDM/schemaDocuments -t cdm-rag:latest .
+#   python scripts/export_corpus_subset.py ../CDM/schemaDocuments corpus_subset
 #
-# (run from inside cdm-rag/; requires BuildKit, the default since Docker 23 -- `docker buildx
-# version` should print something if you're unsure). See the "Running with Docker" section in
-# README.md for the full command, including how to pass GROQ_API_KEY at runtime (never baked
-# into the image).
-#
-# Corpus: build_graph() is fully lazy -- it only reads a file when an import/moniker/
-# extendsEntity chain asks for it (see cdm_rag/inheritance.py's Corpus), never scans the whole
-# schemaDocuments tree. Traced for real (scripts/export_corpus_subset.py): the banking-seeded
-# graph touches ~200 of the corpus's ~58,000 files (~11MB of ~970MB). Stage "corpus_export"
-# derives and copies exactly that subset -- not a hand-maintained list, verified against a
-# full-corpus rebuild -- so the full corpus is never in the final image (or even in "builder").
+# which rebuilds the graph from the trimmed copy and fails loudly if it doesn't produce identical
+# node/edge ids to the full corpus -- not a hand-maintained file list. See the "Running with
+# Docker" / "Deploying to Render" sections in README.md for the full build/run commands and how
+# to pass GROQ_API_KEY at runtime (never baked into the image).
 
 # syntax=docker/dockerfile:1
 
-########## Stage 1: derive the minimal corpus subset (stdlib only, no pip installs) ##########
-# Named "corpus_export" (not "corpus") to avoid colliding with the external named build context
-# also called "corpus" (--build-context corpus=...), which stage 2 copies the result from below.
-FROM python:3.10-slim AS corpus_export
-WORKDIR /export
-COPY cdm_rag/__init__.py cdm_rag/inheritance.py cdm_rag/relationships.py cdm_rag/graph.py ./cdm_rag/
-COPY scripts/export_corpus_subset.py ./scripts/
-COPY --from=corpus . /full_corpus
-RUN python scripts/export_corpus_subset.py /full_corpus /subset
-
-########## Stage 2: install deps and bake the Chroma index ##########
+########## Stage 1: install deps and bake the Chroma index ##########
 FROM python:3.10-slim AS builder
 WORKDIR /app
 # Same cache location as the final stage, so the embedding model downloaded here (once, at
@@ -43,12 +34,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY cdm_rag ./cdm_rag
 COPY scripts/build_index.py ./scripts/build_index.py
-COPY --from=corpus_export /subset ./schemaDocuments
+COPY corpus_subset ./schemaDocuments
 ENV CDM_CORPUS_PATH=/app/schemaDocuments
 # Builds the graph and embeds every chunk now, at build time -- not on first request.
 RUN python scripts/build_index.py
 
-########## Stage 3: runtime image ##########
+########## Stage 2: runtime image ##########
 FROM python:3.10-slim AS final
 WORKDIR /app
 ENV HF_HOME=/app/.cache/huggingface \
