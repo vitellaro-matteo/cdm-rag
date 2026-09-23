@@ -1,0 +1,27 @@
+# Render Blueprint for cdm-rag. Deploy via https://dashboard.render.com/blueprints -> "New
+# Blueprint Instance", pointing at this repo -- Render reads this file automatically. See the
+# README's "Deploying to Render" section for the full explanation, including why the corpus is a
+# committed subset (corpus_subset/) rather than an external build context (Render's standard
+# Docker build only has one build context: this repo).
+services:
+  - type: web
+    name: cdm-rag
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # Required for POST /ask; GET /health and GET /entities/{name} work without it. Marked
+      # sync: false so Render prompts for it in the dashboard instead of it ever living in this
+      # file or git history.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        value: openai/gpt-oss-120b
+      # Optional demo protections (cdm_rag/demo_guard.py) -- both are true no-ops if removed or
+      # left blank. See the README section this file's header points to before changing these.
+      - key: DEMO_ACCESS_KEY
+        sync: false
+      - key: DEMO_RATE_LIMIT_PER_HOUR
+        value: "15"

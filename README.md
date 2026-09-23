@@ -450,30 +450,33 @@ python scripts/eval.py 11 20    # resume just Q11-Q20, e.g. after a rate-limit i
 ## 7. Running with Docker
 
 The image is self-contained at runtime: it ships a pre-built Chroma index and the embedding
-model's weights, so a container starts instantly with no first-request cold-start. The CDM
-corpus lives *outside* this repo, so it's supplied at **build** time only, as a separate named
-build context — nothing about it is needed to *run* the image afterward.
+model's weights, so a container starts instantly with no first-request cold-start. The build is a
+single, standard build context (`docker build .`) — no external directory needed. That wasn't
+always true: the CDM corpus lives outside this repo, and the build needs only the ~200 files
+(~12MB of the corpus's ~970MB) `build_graph()` actually reads (see `Dockerfile`'s header comment).
+Earlier this was supplied at build time as a second, external named build context; that doesn't
+work on a host like Render whose Docker builds only have one context, so that trimmed subset is
+instead **committed directly into this repo** at `corpus_subset/` — derived and verified with
+`scripts/export_corpus_subset.py` (its own `verify()` step rebuilds the graph from the trimmed
+copy and fails loudly if it doesn't produce identical node/edge ids to the full corpus; confirmed
+independently too: 54 nodes / 133 edges, identical ids, both builds). Re-run that script only if
+the CDM schema itself changes.
 
 ### Build
 
-Requires BuildKit (the default since Docker 23; check with `docker buildx version` if unsure)
-and a local checkout of the CDM corpus as a sibling of this repo (`../CDM/schemaDocuments`,
-same layout `CDM_CORPUS_PATH` defaults to elsewhere in this project).
-
 ```bash
-docker build --build-context corpus=../CDM/schemaDocuments -t cdm-rag:latest .
+docker build -t cdm-rag:latest .
 ```
 
-Run from inside this directory (`cdm-rag/`). The build reads the full corpus only to derive and
-bake in the ~200 files (~11MB) `build_graph()` actually needs (see `Dockerfile`'s header comment
-and `scripts/export_corpus_subset.py`) — the full corpus is never copied into any image layer.
-It also downloads the embedding model and builds the vector index, so the build needs network
-access and takes a couple of minutes; the resulting image does not need either at runtime.
+Run from inside this directory (`cdm-rag/`). The build downloads the embedding model and builds
+the vector index, so it needs network access and takes a couple of minutes; the resulting image
+needs neither at runtime.
 
 ### Run
 
 `GROQ_API_KEY` (and optionally `LLM_MODEL`) must be passed at **run** time — they are never
-baked into the image. Everything except `POST /ask` works without them.
+baked into the image. Everything except `POST /ask` works without them. `DEMO_ACCESS_KEY` /
+`DEMO_RATE_LIMIT_PER_HOUR` are optional (see Section 9, below) and off by default.
 
 ```bash
 docker run --rm -p 8000:8000 --env-file .env cdm-rag:latest
@@ -484,7 +487,7 @@ docker run --rm -p 8000:8000 -e GROQ_API_KEY=... -e LLM_MODEL=openai/gpt-oss-120
 Or with Compose (reads `.env` automatically for both build and run):
 
 ```bash
-docker compose build --build-context corpus=../CDM/schemaDocuments
+docker compose build
 docker compose up
 ```
 
@@ -498,7 +501,55 @@ curl -X POST http://localhost:8000/ask \
   -d '{"question": "How does Contact relate to Organization?"}'
 ```
 
-## 8. How this was built
+## 8. Deploying to Render
+
+`render.yaml` at the repo root is a Render Blueprint: from the
+[Render dashboard](https://dashboard.render.com/blueprints) → "New Blueprint Instance" → point it
+at this repo, and Render reads that file automatically (a Docker-based web service, health check
+at `/health`). No manual service configuration is needed beyond what it declares, except:
+
+- **`GROQ_API_KEY`** — marked `sync: false` in `render.yaml`, so Render prompts for it in the
+  dashboard rather than it ever being written into this file or git history. Set it there.
+- **`DEMO_ACCESS_KEY`** (optional) — also `sync: false`; set it in the dashboard to require an
+  `X-Demo-Key` header on `POST /ask` (see Section 9). Leave it unset to leave `/ask` open.
+- **`DEMO_RATE_LIMIT_PER_HOUR`** — defaults to `15` in `render.yaml`; edit or remove that entry
+  to change or disable it.
+
+This is exactly why `corpus_subset/` is committed rather than supplied as an external Docker
+build context (see Section 7): Render's standard Docker build has a single build context (this
+repo) and no equivalent of `docker build --build-context`, so the corpus had to move from "an
+external directory the build reaches out to" to "a file already in the repo it's building."
+
+Free-tier notes: a free Render web service spins down after a period of inactivity and takes
+some time to cold-start on the next request — expect the first request after idle to be slow
+even though the Chroma index itself is pre-built (it's the container/instance starting, not the
+index). This is a Render platform characteristic, not something this project's build fixes.
+
+## 9. Protecting a public demo deployment
+
+`POST /ask` is the only endpoint that costs a real Groq API call, so it's the only one with any
+protection, and both mechanisms below are optional, independently toggled by environment variable,
+and true no-ops when unset — local development and any deployment that doesn't opt in are
+completely unaffected. Neither is security-grade; the goal is narrower: stop *accidental or
+automated* quota exhaustion from outside traffic while a public demo URL isn't actively being
+shown to someone. See `cdm_rag/demo_guard.py`.
+
+- **`DEMO_ACCESS_KEY`** — when set, `POST /ask` requires a matching `X-Demo-Key: <value>` header,
+  else `401`. `GET /health` and `GET /entities/{name}` are never affected.
+- **`DEMO_RATE_LIMIT_PER_HOUR`** — when set to a positive integer, `POST /ask` is capped to that
+  many requests per rolling hour, globally across all callers, `429`ing once exceeded. A single
+  in-memory counter — not distributed, not persisted across restarts, reset whenever the process
+  restarts — which is exactly the amount of protection a single-instance demo needs, not an
+  attempt at real rate-limiting infrastructure. A request rejected by `DEMO_ACCESS_KEY` never
+  consumes a slot of this budget (checked first).
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" -H "X-Demo-Key: your-secret-here" \
+  -d '{"question": "How does Contact relate to Organization?"}'
+```
+
+## 10. How this was built
 
 This was developed with Claude Code assisting on implementation under my direction: I made the
 architecture decisions, verified findings against the real corpus at each step rather than
