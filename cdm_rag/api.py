@@ -24,7 +24,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from cdm_rag import router, store
+from cdm_rag import demo_guard, router, store
 from cdm_rag.config import corpus_path
 from cdm_rag.graph import Graph, banking_seeds, build_graph, entity_detail, find_entity
 from cdm_rag.inheritance import Corpus
@@ -189,12 +189,23 @@ def _source_item(graph: Graph, item: dict[str, Any]) -> SourceItem:
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask(payload: AskRequest, graph: Graph = Depends(get_graph), collection: Any = Depends(get_collection)) -> AskResponse:
+def ask(
+    payload: AskRequest,
+    _access: None = Depends(demo_guard.require_demo_access),
+    _rate: None = Depends(demo_guard.enforce_rate_limit),
+    graph: Graph = Depends(get_graph),
+    collection: Any = Depends(get_collection),
+) -> AskResponse:
     """Answer ``question`` via ``router.answer`` (routing -> retrieval -> generation), and
     return the answer alongside exactly which entities/relationships/notes it was grounded in
     (``sources``) and the raw context text sent to the model (``context_used``), so the answer
     is traceable rather than an opaque string. Requires ``GROQ_API_KEY``/``LLM_MODEL`` to be
-    configured (see .env.example) -- that is the only thing in this app that does."""
+    configured (see .env.example) -- that is the only thing in this app that does.
+
+    Also gated by ``demo_guard.require_demo_access``/``enforce_rate_limit`` -- both true no-ops
+    unless their respective env var (``DEMO_ACCESS_KEY``/``DEMO_RATE_LIMIT_PER_HOUR``) is set; see
+    ``demo_guard.py``. Declared before the graph/collection dependencies so a rejected request
+    never reaches ``router.answer`` (and so never touches Groq)."""
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="question must not be empty")

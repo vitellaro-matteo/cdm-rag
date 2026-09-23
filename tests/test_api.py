@@ -3,9 +3,21 @@ import sys
 import pytest
 from fastapi.testclient import TestClient
 
-from cdm_rag import api, router
+from cdm_rag import api, demo_guard, router
 from cdm_rag.graph import banking_seeds, build_graph
 from cdm_rag.inheritance import Corpus
+
+
+@pytest.fixture(autouse=True)
+def _clean_demo_guard_state(monkeypatch):
+    """Every test starts with both demo_guard env vars unset and a clean rate-limit window, so
+    one test's opt-in doesn't leak into the next -- and so every test written before demo_guard
+    existed keeps running exactly as before by default."""
+    monkeypatch.delenv(demo_guard.DEMO_ACCESS_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv(demo_guard.DEMO_RATE_LIMIT_ENV_VAR, raising=False)
+    demo_guard.reset_rate_limit_state()
+    yield
+    demo_guard.reset_rate_limit_state()
 
 
 @pytest.fixture(scope="module")
@@ -143,6 +155,109 @@ def test_ask_empty_question_returns_400_and_never_calls_router(client_with_fake_
 def test_ask_missing_question_field_is_a_validation_error(client_with_fake_deps):
     r = client_with_fake_deps.post("/ask", json={})
     assert r.status_code == 422
+
+
+# --- demo_guard: shared-secret access key ---------------------------------------------------
+
+
+def test_ask_works_normally_with_no_demo_key_header_when_demo_access_key_is_unset(client_with_fake_deps, monkeypatch):
+    # DEMO_ACCESS_KEY is unset by the autouse fixture -- current behavior, completely unaffected.
+    monkeypatch.setattr(router, "answer", lambda *a, **k: router.AnswerResult(answer="ok", context=[]))
+
+    r = client_with_fake_deps.post("/ask", json={"question": "How does Branch relate to Bank?"})
+
+    assert r.status_code == 200
+    assert r.json()["answer"] == "ok"
+
+
+def test_ask_is_blocked_with_a_missing_key_when_demo_access_key_is_set(client_with_fake_deps, monkeypatch):
+    monkeypatch.setenv(demo_guard.DEMO_ACCESS_KEY_ENV_VAR, "secret123")
+    monkeypatch.setattr(router, "answer", lambda *a, **k: pytest.fail("router.answer must not be called when auth fails"))
+
+    r = client_with_fake_deps.post("/ask", json={"question": "How does Branch relate to Bank?"})
+
+    assert r.status_code == 401
+    assert "X-Demo-Key" in r.json()["detail"]
+
+
+def test_ask_is_blocked_with_a_wrong_key_when_demo_access_key_is_set(client_with_fake_deps, monkeypatch):
+    monkeypatch.setenv(demo_guard.DEMO_ACCESS_KEY_ENV_VAR, "secret123")
+    monkeypatch.setattr(router, "answer", lambda *a, **k: pytest.fail("router.answer must not be called when auth fails"))
+
+    r = client_with_fake_deps.post("/ask", json={"question": "How does Branch relate to Bank?"}, headers={"X-Demo-Key": "wrong"})
+
+    assert r.status_code == 401
+
+
+def test_ask_succeeds_with_the_correct_key_when_demo_access_key_is_set(client_with_fake_deps, monkeypatch):
+    monkeypatch.setenv(demo_guard.DEMO_ACCESS_KEY_ENV_VAR, "secret123")
+    monkeypatch.setattr(router, "answer", lambda *a, **k: router.AnswerResult(answer="ok", context=[]))
+
+    r = client_with_fake_deps.post("/ask", json={"question": "How does Branch relate to Bank?"}, headers={"X-Demo-Key": "secret123"})
+
+    assert r.status_code == 200
+    assert r.json()["answer"] == "ok"
+
+
+# --- demo_guard: rate limit --------------------------------------------------------------------
+
+
+def test_ask_rate_limit_does_not_trigger_when_demo_rate_limit_is_unset(client_with_fake_deps, monkeypatch):
+    monkeypatch.setattr(router, "answer", lambda *a, **k: router.AnswerResult(answer="ok", context=[]))
+
+    for _ in range(20):  # well beyond any real cap -- proves the limiter is a true no-op when off
+        r = client_with_fake_deps.post("/ask", json={"question": "How does Branch relate to Bank?"})
+        assert r.status_code == 200
+
+
+def test_ask_rate_limit_triggers_once_the_cap_is_reached(client_with_fake_deps, monkeypatch):
+    monkeypatch.setenv(demo_guard.DEMO_RATE_LIMIT_ENV_VAR, "2")
+    monkeypatch.setattr(router, "answer", lambda *a, **k: router.AnswerResult(answer="ok", context=[]))
+
+    first = client_with_fake_deps.post("/ask", json={"question": "How does Branch relate to Bank?"})
+    second = client_with_fake_deps.post("/ask", json={"question": "How does Branch relate to Bank?"})
+    third = client_with_fake_deps.post("/ask", json={"question": "How does Branch relate to Bank?"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 429
+    assert "rate limit" in third.json()["detail"].lower()
+
+
+def test_ask_rate_limit_does_not_count_requests_rejected_for_a_bad_key(client_with_fake_deps, monkeypatch):
+    # A request that fails auth must not consume the shared rate-limit budget -- otherwise an
+    # unauthenticated caller could exhaust it for everyone with repeated wrong-key attempts.
+    monkeypatch.setenv(demo_guard.DEMO_ACCESS_KEY_ENV_VAR, "secret123")
+    monkeypatch.setenv(demo_guard.DEMO_RATE_LIMIT_ENV_VAR, "1")
+    monkeypatch.setattr(router, "answer", lambda *a, **k: router.AnswerResult(answer="ok", context=[]))
+
+    for _ in range(5):
+        r = client_with_fake_deps.post("/ask", json={"question": "How does Branch relate to Bank?"}, headers={"X-Demo-Key": "wrong"})
+        assert r.status_code == 401
+
+    ok = client_with_fake_deps.post("/ask", json={"question": "How does Branch relate to Bank?"}, headers={"X-Demo-Key": "secret123"})
+    assert ok.status_code == 200  # the budget of 1 is still intact despite 5 failed attempts
+
+
+# --- demo_guard never affects /health or /entities ----------------------------------------------
+
+
+def test_health_is_unaffected_by_either_demo_guard_mechanism(client, monkeypatch):
+    monkeypatch.setenv(demo_guard.DEMO_ACCESS_KEY_ENV_VAR, "secret123")
+    monkeypatch.setenv(demo_guard.DEMO_RATE_LIMIT_ENV_VAR, "0")  # 0 -> treated as off, but even a real value wouldn't apply here
+
+    for _ in range(5):
+        r = client.get("/health")
+        assert r.status_code == 200
+
+
+def test_get_entity_is_unaffected_by_either_demo_guard_mechanism(client, monkeypatch):
+    monkeypatch.setenv(demo_guard.DEMO_ACCESS_KEY_ENV_VAR, "secret123")
+    monkeypatch.setenv(demo_guard.DEMO_RATE_LIMIT_ENV_VAR, "1")
+
+    for _ in range(5):  # no X-Demo-Key header at all, still succeeds every time
+        r = client.get("/entities/Account")
+        assert r.status_code == 200
 
 
 # --- works without GROQ_API_KEY, except /ask --------------------------------------------------
