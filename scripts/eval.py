@@ -322,22 +322,36 @@ def check_q14(gt: dict[str, Any], r: QuestionResult) -> list[Check]:
     ]
 
 
+#: Phrases that mean "no path exists at all" -- deliberately narrower than NEGATION_PHRASES /
+#: NO_RELATIONSHIP_PHRASES, which also match "no DIRECT relationship." That phrasing is CORRECT
+#: for Q16 (there's genuinely no direct edge, but a real indirect path does exist -- see
+#: check_q16), so treating it as a denial produced a false FAIL the first time this check ran
+#: for real: the router's multi-hop fallback (Graph.find_path) surfaced the real path correctly
+#: and the model named it in full, but still opened with the accurate "no direct relationship"
+#: framing this project's own system prompt trains it to use.
+NO_PATH_AT_ALL_PHRASES = [
+    "no path", "no connection", "not connected", "cannot be connected", "no way to connect",
+    "entirely unrelated", "no relationship at all", "there is no relationship",
+]
+
+
 def check_q16(gt: dict[str, Any], r: QuestionResult) -> list[Check]:
     # Ground truth (verified against the graph, not assumed from the question -- see
     # ground_truth()'s "collateral_to_bank_path"): a real 3-hop path exists,
     # Collateral -> FinancialProduct -> Branch -> Bank. There is no direct edge, but there IS a
-    # real path, so an answer that flatly denies any connection is wrong, not appropriately
-    # cautious. The router's relations_between() only surfaces ONE hop of near-miss from each
-    # side (Collateral->FinancialProduct, Branch/Syndicates->Bank) -- it does not chain them, so
-    # this question tests whether the model (or vector search) bridges that gap on its own.
-    denies_path = contains_any(r.answer, NEGATION_PHRASES + NO_RELATIONSHIP_PHRASES)
+    # real path, so an answer that flatly denies any connection at all is wrong, not appropriately
+    # cautious -- unlike "no DIRECT relationship, but ...", which is the correct framing. The
+    # router's relations_between() only surfaces one hop of near-miss from each side
+    # (Collateral->FinancialProduct, Branch/Syndicates->Bank); Graph.find_path is the fallback
+    # that bridges the full chain when that comes up completely empty (see router._route).
+    denies_any_path = contains_any(r.answer, NO_PATH_AT_ALL_PHRASES)
     names_financial_product = "FinancialProduct" in r.answer
     names_branch = "Branch" in r.answer
     return [
         Check(
-            "answer does not falsely deny any path exists (real path: Collateral -> FinancialProduct -> Branch -> Bank)",
-            not denies_path,
-            denies_path or "",
+            "answer does not deny that any path exists at all (real path: Collateral -> FinancialProduct -> Branch -> Bank)",
+            not denies_any_path,
+            denies_any_path or "",
         ),
         Check("answer's path includes FinancialProduct (the real first hop from Collateral)", names_financial_product),
         Check(
