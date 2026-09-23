@@ -33,6 +33,7 @@ def test_chat_passes_model_and_messages_through_and_returns_reply_text(monkeypat
 
     class FakeChoice:
         message = FakeMessage()
+        finish_reason = "stop"
 
     class FakeCompletions:
         def create(self, model, messages, timeout=None, max_tokens=None):
@@ -70,6 +71,7 @@ def test_chat_retries_once_on_timeout_then_succeeds(monkeypatch):
 
     class FakeChoice:
         message = FakeMessage()
+        finish_reason = "stop"
 
     calls = []
 
@@ -114,3 +116,104 @@ def test_chat_raises_after_second_timeout(monkeypatch):
 
     with pytest.raises(APITimeoutError):
         llm_client.chat([{"role": "user", "content": "hi"}])
+
+
+# --- truncation detection (finish_reason == "length") -----------------------------------------
+
+
+def test_chat_raises_response_truncated_error_when_finish_reason_is_length(monkeypatch):
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+
+    class FakeMessage:
+        content = "cut off mid-sent"
+
+    class FakeChoice:
+        message = FakeMessage()
+        finish_reason = "length"
+
+    class FakeCompletions:
+        def create(self, model, messages, timeout=None, max_tokens=None):
+            return type("R", (), {"choices": [FakeChoice()], "usage": None})()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    monkeypatch.setattr(llm_client, "_client", lambda: FakeClient())
+
+    with pytest.raises(llm_client.ResponseTruncatedError) as exc_info:
+        llm_client.chat([{"role": "user", "content": "hi"}], max_tokens=123)
+
+    assert exc_info.value.partial_text == "cut off mid-sent"
+    assert exc_info.value.max_tokens == 123
+    assert "length" in str(exc_info.value)
+    assert isinstance(exc_info.value, RuntimeError)  # caught for free by existing RuntimeError handling
+
+
+def test_chat_passes_a_custom_max_tokens_through_to_the_real_call(monkeypatch):
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+
+    class FakeMessage:
+        content = "ok"
+
+    class FakeChoice:
+        message = FakeMessage()
+        finish_reason = "stop"
+
+    class FakeCompletions:
+        def create(self, model, messages, timeout=None, max_tokens=None):
+            self.seen_max_tokens = max_tokens
+            return type("R", (), {"choices": [FakeChoice()], "usage": None})()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_client, "_client", lambda: fake)
+
+    llm_client.chat([{"role": "user", "content": "hi"}], max_tokens=6000)
+
+    assert fake.chat.completions.seen_max_tokens == 6000
+
+
+def test_chat_still_captures_usage_on_a_truncated_response(monkeypatch):
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+
+    class FakeMessage:
+        content = "partial"
+
+    class FakeChoice:
+        message = FakeMessage()
+        finish_reason = "length"
+
+    class FakeUsage:
+        prompt_tokens = 10
+        completion_tokens = 20
+        total_tokens = 30
+        queue_time = 0.1
+        prompt_time = 0.2
+        completion_time = 0.3
+        total_time = 0.6
+
+    class FakeCompletions:
+        def create(self, model, messages, timeout=None, max_tokens=None):
+            return type("R", (), {"choices": [FakeChoice()], "usage": FakeUsage()})()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    monkeypatch.setattr(llm_client, "_client", lambda: FakeClient())
+
+    usage: dict = {}
+    with pytest.raises(llm_client.ResponseTruncatedError):
+        llm_client.chat([{"role": "user", "content": "hi"}], capture_usage=usage)
+
+    assert usage["completion_tokens"] == 20  # real diagnostic data, even though the call raised

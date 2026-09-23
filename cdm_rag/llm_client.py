@@ -42,7 +42,33 @@ RETRY_BACKOFF_SECONDS = 3.0
 # alone cannot prevent rate-limiting on the free/on-demand tier: Groq enforces an account-level
 # 8000 tokens-per-minute limit, and Q1's prompt alone is ~5265 tokens, so even a "successful"
 # ~1900-token completion already consumes ~90% of the whole per-minute budget by itself.
+#
+# This is not a guarantee of completeness by itself: which format the model picks for an
+# "enumerate everything" question (a compact list vs. a markdown table, which costs several times
+# more tokens per attribute) varies run to run, so a cap sized against one run's completion can
+# still truncate a later run of a *different* question that happens to need more (this is exactly
+# what happened to Q11 in a real eval run -- see ResponseTruncatedError below, which exists so
+# that failure is caught and retried rather than silently served as a complete answer).
 MAX_COMPLETION_TOKENS = 3000
+
+
+class ResponseTruncatedError(RuntimeError):
+    """Raised by ``chat()`` when Groq's own ``finish_reason`` is ``"length"`` -- the completion
+    was cut off by ``max_tokens``, not a natural stopping point. ``chat()`` never returns
+    truncated text as if it were a complete answer; the caller must explicitly decide what to do
+    (see ``generate.answer``'s retry-once-then-surface-an-error handling). Subclasses
+    ``RuntimeError`` so it's caught for free by any existing ``except RuntimeError`` handling
+    already in place for llm_client's other hard-error cases (e.g. ``api.py``'s ``/ask``, which
+    turns a missing API key into a 503 the same way).
+
+    ``partial_text`` is the truncated content (kept for logging/diagnostics -- never returned to
+    a caller as a normal answer) and ``max_tokens`` is the cap that was actually used for this
+    call, so a caller retrying with a higher cap knows what "higher" means relative to."""
+
+    def __init__(self, partial_text: str, max_tokens: int):
+        self.partial_text = partial_text
+        self.max_tokens = max_tokens
+        super().__init__(f"response truncated at max_tokens={max_tokens} (finish_reason='length')")
 
 
 def _model_name() -> str:
@@ -62,16 +88,20 @@ def _client():
     return Groq(api_key=api_key, max_retries=0)
 
 
-def _create(client, model: str, messages: list[dict[str, str]]):
+def _create(client, model: str, messages: list[dict[str, str]], max_tokens: int):
     return client.chat.completions.create(
         model=model,
         messages=messages,
         timeout=REQUEST_TIMEOUT_SECONDS,
-        max_tokens=MAX_COMPLETION_TOKENS,
+        max_tokens=max_tokens,
     )
 
 
-def chat(messages: list[dict[str, str]], capture_usage: dict[str, Any] | None = None) -> str:
+def chat(
+    messages: list[dict[str, str]],
+    capture_usage: dict[str, Any] | None = None,
+    max_tokens: int = MAX_COMPLETION_TOKENS,
+) -> str:
     """Send ``messages`` (OpenAI-style ``{"role": ..., "content": ...}`` dicts) to the
     configured model and return the reply text. Checks ``LLM_MODEL`` before touching the
     client, so a missing model name fails immediately, before any API key check or network call.
@@ -79,25 +109,33 @@ def chat(messages: list[dict[str, str]], capture_usage: dict[str, Any] | None = 
     Bounded by ``REQUEST_TIMEOUT_SECONDS``; on a timeout or connection error, retries exactly
     once after ``RETRY_BACKOFF_SECONDS`` and logs a warning. A second failure propagates -- this
     exists so a silently-throttled call fails fast and predictably instead of hanging, not to
-    paper over a genuine outage. Completions are capped at ``MAX_COMPLETION_TOKENS``.
+    paper over a genuine outage. Completions are capped at ``max_tokens`` (default
+    ``MAX_COMPLETION_TOKENS``) -- a caller can pass a higher value for a deliberate retry (see
+    ``generate.answer``).
+
+    Raises ``ResponseTruncatedError`` -- never returns truncated text as if it were a complete
+    answer -- when the response's own ``finish_reason`` is ``"length"``.
 
     ``capture_usage``, when given a dict, gets Groq's own reported ``prompt_tokens``,
     ``completion_tokens``, ``total_tokens``, and its server-side ``queue_time``/``prompt_time``/
     ``completion_time``/``total_time`` (seconds) -- real usage/timing from the API response
-    itself, not a client-side estimate. Diagnostic only; omitted, behavior is unchanged."""
+    itself, not a client-side estimate. Populated even when the response turns out to be
+    truncated (still real, useful diagnostic data). Diagnostic only; omitted, behavior is
+    otherwise unchanged."""
     from groq import APIConnectionError, APITimeoutError  # deferred, same reason as _client()
 
     model = _model_name()
     client = _client()
     try:
-        response = _create(client, model, messages)
+        response = _create(client, model, messages, max_tokens)
     except (APITimeoutError, APIConnectionError) as exc:
         logger.warning(
             "llm_client.chat: request failed after %.0fs (%s: %s); retrying once after %.0fs backoff",
             REQUEST_TIMEOUT_SECONDS, type(exc).__name__, exc, RETRY_BACKOFF_SECONDS,
         )
         time.sleep(RETRY_BACKOFF_SECONDS)
-        response = _create(client, model, messages)
+        response = _create(client, model, messages, max_tokens)
+    choice = response.choices[0]
     if capture_usage is not None and response.usage is not None:
         u = response.usage
         capture_usage.update(
@@ -109,4 +147,6 @@ def chat(messages: list[dict[str, str]], capture_usage: dict[str, Any] | None = 
             completion_time=getattr(u, "completion_time", None),
             total_time=getattr(u, "total_time", None),
         )
-    return response.choices[0].message.content
+    if choice.finish_reason == "length":
+        raise ResponseTruncatedError(choice.message.content, max_tokens)
+    return choice.message.content

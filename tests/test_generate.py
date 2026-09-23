@@ -57,6 +57,62 @@ def test_empty_chunk_list_still_calls_the_llm_with_a_says_so_context(monkeypatch
     assert "no chunks were retrieved" in seen["messages"][1]["content"].lower()
 
 
+# --- truncation retry (see llm_client.ResponseTruncatedError) ---------------------------------
+
+
+def test_answer_retries_once_with_doubled_max_tokens_after_truncation(monkeypatch):
+    calls = []
+
+    def fake_chat(messages, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise generate.llm_client.ResponseTruncatedError("cut off", max_tokens=100)
+        return "complete answer"
+
+    monkeypatch.setattr(generate.llm_client, "chat", fake_chat)
+
+    result = generate.answer("q", [])
+
+    assert result == "complete answer"
+    assert len(calls) == 2
+    assert "max_tokens" not in calls[0]  # first attempt uses llm_client's own default, unspecified here
+    assert calls[1]["max_tokens"] == 200  # doubled from the raised exception's max_tokens=100
+
+
+def test_answer_raises_a_clear_error_when_the_retry_also_truncates(monkeypatch):
+    # A second truncation must never be swallowed or served as a partial answer -- it propagates.
+    def fake_chat(messages, **kwargs):
+        raise generate.llm_client.ResponseTruncatedError("still cut off", max_tokens=100)
+
+    monkeypatch.setattr(generate.llm_client, "chat", fake_chat)
+
+    with pytest.raises(generate.llm_client.ResponseTruncatedError):
+        generate.answer("q", [])
+
+
+def test_answer_retry_clears_stale_usage_before_the_successful_retrys_own_usage(monkeypatch):
+    calls = []
+
+    def fake_chat(messages, capture_usage=None, max_tokens=None):
+        calls.append(max_tokens)
+        if len(calls) == 1:
+            if capture_usage is not None:
+                capture_usage.update(completion_tokens=999)  # stale: must not survive into `timing`
+            raise generate.llm_client.ResponseTruncatedError("cut off", max_tokens=100)
+        if capture_usage is not None:
+            capture_usage.update(completion_tokens=50)
+        return "complete answer"
+
+    monkeypatch.setattr(generate.llm_client, "chat", fake_chat)
+
+    timing: dict = {}
+    result = generate.answer("q", [], timing=timing)
+
+    assert result == "complete answer"
+    assert calls == [None, 200]
+    assert timing["completion_tokens"] == 50
+
+
 def test_no_module_other_than_llm_client_imports_groq():
     import pathlib
     import re
